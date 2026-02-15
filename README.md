@@ -97,6 +97,10 @@ Alternatively, you can run inference without control actions:
 ``` sh
 torchrun --nproc_per_node=8 generate.py --task i2v-A14B --size 480*832 --ckpt_dir lingbot-world-base-cam --image examples/00/image.jpg --dit_fsdp --t5_fsdp --ulysses_size 8 --frame_num 161 --prompt "The video presents a soaring journey through a fantasy jungle. The wind whips past the rider's blue hands gripping the reins, causing the leather straps to vibrate. The ancient gothic castle approaches steadily, its stone details becoming clearer against the backdrop of floating islands and distant waterfalls."
 ```
+If you are working with a single GPU, change --nproc_per_node=8 to --nproc_per_node=1 and remove the parameters --dit_fsdp --t5_fsdp --ulysses_size 8
+``` sh
+torchrun --nproc_per_node=1 generate.py --task i2v-A14B --size 480*832 --ckpt_dir lingbot-world-base-cam --image examples/00/image.jpg --frame_num 161 --prompt "The video presents a soaring journey through a fantasy jungle. The wind whips past the rider's blue hands gripping the reins, causing the leather straps to vibrate. The ancient gothic castle approaches steadily, its stone details becoming clearer against the backdrop of floating islands and distant waterfalls."
+```
 Tips:
 If you have sufficient CUDA memory, you may increase the `frame_num` parameter to a value such as 961 to generate a one-minute video at 16 FPS. Otherwise if the CUDA memory is not sufficient, you may use ``--t5_cpu`` to decrease the memory usage.
 
