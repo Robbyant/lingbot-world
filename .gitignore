@@ -1,3 +1,18 @@
 __pycache__/
 .DS_Store
 .vscode*
+
+# local dev environment
+.venv/
+.python-version
+
+# downloaded model weights (use huggingface-cli to fetch)
+lingbot-world-base-cam/
+lingbot-world-base-act-preview/
+lingbot-world-fast/
+
+# generated outputs
+output/
+output_base/
+*.mp4
+!assets/*.mp4

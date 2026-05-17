@@ -4,9 +4,28 @@ import math
 import os
 import random
 import sys
+import time
 import types
 from contextlib import contextmanager
 from functools import partial
+
+
+def _phase(name):
+    """Phase timer. Prints elapsed seconds on rank 0 after GPU sync."""
+    @contextmanager
+    def _cm():
+        if dist.is_initialized():
+            torch.cuda.synchronize()
+            dist.barrier()
+        t0 = time.perf_counter()
+        yield
+        if dist.is_initialized():
+            torch.cuda.synchronize()
+            dist.barrier()
+        dt = time.perf_counter() - t0
+        if (not dist.is_initialized()) or dist.get_rank() == 0:
+            logging.info(f"[PROFILE] {name}: {dt*1000:.1f} ms")
+    return _cm()
 
 import numpy as np
 import torch
@@ -317,14 +336,15 @@ class WanI2VFast:
         timesteps = self.scheduler.timesteps[timesteps_index]
 
         # preprocess
-        if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            if offload_model:
-                self.text_encoder.model.cpu()
-        else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
+        with _phase("t5_encode"):
+            if not self.t5_cpu:
+                self.text_encoder.model.to(self.device)
+                context = self.text_encoder([input_prompt], self.device)
+                if offload_model:
+                    self.text_encoder.model.cpu()
+            else:
+                context = self.text_encoder([input_prompt], torch.device('cpu'))
+                context = [t.to(self.device) for t in context]
 
         # cam preparation (only if action_path is provided)
         dit_cond_dict = None
@@ -381,15 +401,16 @@ class WanI2VFast:
                 wasd_action_tensor = rearrange(wasd_action_tensor, 'b (f h w) c -> b c f h w', f=lat_f, h=lat_h, w=lat_w).to(self.param_dtype)
                 c2ws_plucker_emb = torch.cat([c2ws_plucker_emb, wasd_action_tensor], dim=1)
 
-        y = self.vae.encode([
-            torch.concat([
-                torch.nn.functional.interpolate(
-                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
-                torch.zeros(3, F - 1, h, w)
-            ],
-                         dim=1).to(self.device)
-        ])[0]
+        with _phase("vae_encode_image"):
+            y = self.vae.encode([
+                torch.concat([
+                    torch.nn.functional.interpolate(
+                        img[None].cpu(), size=(h, w), mode='bicubic').transpose(
+                            0, 1),
+                    torch.zeros(3, F - 1, h, w)
+                ],
+                             dim=1).to(self.device)
+            ])[0]
         y = torch.concat([msk, y])
 
         @contextmanager
@@ -454,38 +475,40 @@ class WanI2VFast:
                 if offload_model:
                     torch.cuda.empty_cache()
 
-                for timestep_idx in range(len(timesteps)):
-                    latent_model_input = [current_latent.to(self.device)]
-                    current_timestep = [timesteps[timestep_idx]]
+                with _phase(f"chunk{chunk_id}_denoise_{len(timesteps)}steps"):
+                    for timestep_idx in range(len(timesteps)):
+                        latent_model_input = [current_latent.to(self.device)]
+                        current_timestep = [timesteps[timestep_idx]]
 
-                    timestep = torch.stack(current_timestep).to(self.device)
+                        timestep = torch.stack(current_timestep).to(self.device)
 
-                    noise_pred = self.model(
-                        x=latent_model_input, t=timestep, **kwargs)[0]
+                        noise_pred = self.model(
+                            x=latent_model_input, t=timestep, **kwargs)[0]
 
-                    if offload_model:
-                        torch.cuda.empty_cache()
+                        if offload_model:
+                            torch.cuda.empty_cache()
 
-                    x0 = self._convert_flow_pred_to_x0(
-                        flow_pred=noise_pred,
-                        xt=current_latent,
-                        timestep=current_timestep[0],
-                        scheduler=self.scheduler,
-                    )
+                        x0 = self._convert_flow_pred_to_x0(
+                            flow_pred=noise_pred,
+                            xt=current_latent,
+                            timestep=current_timestep[0],
+                            scheduler=self.scheduler,
+                        )
 
-                    if timestep_idx < len(timesteps) - 1:
-                        next_timestep = timesteps[timestep_idx + 1]
-                        current_latent = self.scheduler.add_noise(x0, torch.randn(x0.shape, generator=seed_g, device=x0.device, dtype=x0.dtype), next_timestep)
-                    else:
-                        # note return x0
-                        break
+                        if timestep_idx < len(timesteps) - 1:
+                            next_timestep = timesteps[timestep_idx + 1]
+                            current_latent = self.scheduler.add_noise(x0, torch.randn(x0.shape, generator=seed_g, device=x0.device, dtype=x0.dtype), next_timestep)
+                        else:
+                            # note return x0
+                            break
 
                 pred_latent_chunks.append(x0)
 
-                # Update kv cache
-                context_timestep = [timesteps[-1] * 0.0]
-                timestep = torch.stack(context_timestep).to(self.device)
-                self.model(x=[x0], t=timestep, **kwargs)
+                with _phase(f"chunk{chunk_id}_kvcache_update"):
+                    # Update kv cache
+                    context_timestep = [timesteps[-1] * 0.0]
+                    timestep = torch.stack(context_timestep).to(self.device)
+                    self.model(x=[x0], t=timestep, **kwargs)
 
             pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
 
@@ -493,8 +516,9 @@ class WanI2VFast:
                 self.model.cpu()
                 torch.cuda.empty_cache()
 
-            if self.rank == 0:
-                videos = self.vae.decode([pred_latent_chunks])
+            with _phase("vae_decode"):
+                if self.rank == 0:
+                    videos = self.vae.decode([pred_latent_chunks])
 
         # del noise, latent, x0
         # del sample_scheduler
