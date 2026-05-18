@@ -16,3 +16,6 @@ output/
 output_base/
 *.mp4
 !assets/*.mp4
+
+# bench videos (keep MD5 in JSON, drop the file itself)
+bench/videos/

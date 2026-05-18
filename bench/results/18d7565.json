@@ -1,0 +1,38 @@
+{
+  "git_sha": "18d7565",
+  "git_dirty": true,
+  "timestamp": "2026-05-18T00:03:31Z",
+  "config": {
+    "task": "i2v-A14B",
+    "size": "480*832",
+    "ckpt_dir": "lingbot-world-base-cam",
+    "image": "examples/03/image.jpg",
+    "action_path": "examples/03",
+    "frame_num": 81,
+    "base_seed": 42,
+    "prompt": "A serene lakeside scene with a lone tree standing in calm water, surrounded by distant snow-capped mountains under a bright blue sky with drifting white clouds \u2014 gentle ripples reflect the tree and sky, creating a tranquil, meditative atmosphere.",
+    "hardware": "8x H100 80GB"
+  },
+  "phases_ms": {
+    "chunk0_denoise_4steps": 7284.0,
+    "chunk0_kvcache_update": 251.5,
+    "chunk1_denoise_4steps": 1005.3,
+    "chunk1_kvcache_update": 248.5,
+    "chunk2_denoise_4steps": 1036.7,
+    "chunk2_kvcache_update": 256.3,
+    "chunk3_denoise_4steps": 1064.1,
+    "chunk3_kvcache_update": 265.3,
+    "chunk4_denoise_4steps": 1086.2,
+    "chunk4_kvcache_update": 277.6,
+    "chunk5_denoise_4steps": 1117.3,
+    "chunk5_kvcache_update": 282.1,
+    "chunk6_denoise_4steps": 1151.8,
+    "chunk6_kvcache_update": 287.6,
+    "t5_encode": 398.5,
+    "vae_decode": 3125.8,
+    "vae_encode_image": 2504.2
+  },
+  "total_generate_ms": 22146.4,
+  "output_md5": "ed2f82628308a3f8acd9b7935bb84401",
+  "output_mp4": "bench/videos/18d7565.mp4"
+}
