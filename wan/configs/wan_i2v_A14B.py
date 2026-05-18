@@ -28,6 +28,7 @@ i2v_A14B.cross_attn_norm = True
 i2v_A14B.eps = 1e-6
 i2v_A14B.low_noise_checkpoint = 'low_noise_model'
 i2v_A14B.high_noise_checkpoint = 'high_noise_model'
+i2v_A14B.fast_noise_checkpoint = 'lingbot_world_fast'
 
 # inference
 i2v_A14B.sample_shift = 10.0

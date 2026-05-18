@@ -775,10 +775,15 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
                 original_samples.device, dtype=torch.float32)
         else:
             schedule_timesteps = self.timesteps.to(original_samples.device)
-            timesteps = timesteps.to(original_samples.device)
+            if isinstance(timesteps, list):
+                timesteps = [timestep.to(original_samples.device) for timestep in timesteps]
+            else:
+                timesteps = timesteps.to(original_samples.device)
 
         # begin_index is None when the scheduler is used for training or pipeline does not implement set_begin_index
         if self.begin_index is None:
+            if not isinstance(timesteps, list):
+                timesteps = [timesteps]
             step_indices = [
                 self.index_for_timestep(t, schedule_timesteps)
                 for t in timesteps

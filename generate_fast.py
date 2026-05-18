@@ -22,9 +22,9 @@ from wan.utils.utils import merge_video_audio, save_video, str2bool
 EXAMPLE_PROMPT = {
     "i2v-A14B": {
         "prompt":
-            "The video presents a cinematic, first-person wandering experience through a hyper-realistic urban environment rendered in a video game engine. It begins with a static, sun-drenched alley framed by graffiti-laden industrial walls and overhead power lines, immediately establishing a gritty, lived-in atmosphere. As the camera pans right and tilts upward, it reveals a sprawling cityscape dominated by towering skyscrapers and industrial infrastructure, all bathed in warm, late-afternoon light that casts long shadows and produces dramatic lens flares. The perspective then transitions into a smooth forward tracking shot along a cracked sidewalk, passing weathered fences, palm trees, and distant pedestrians, creating a sense of immersion and exploration. Midway, the camera briefly follows a walking figure before refocusing on the broader streetscape, culminating in a stabilized view of a small blue van parked at an intersection surrounded by urban elements like parking garages and traffic lights. The entire sequence is characterized by its photorealistic detail, dynamic lighting, and deliberate pacing, evoking the feel of a quiet, sunlit afternoon in a futuristic metropolis.",
+            "A sweeping cinematic journey along the Great Wall of China, winding through golden autumn hills under a brilliant blue sky — stone pathways stretch into the distance, watchtowers stand sentinel, and vibrant foliage blankets the mountainsides as the camera glides smoothly forward, capturing the grandeur and timeless majesty of this ancient wonder.",
         "image":
-            "examples/02/image.jpg",
+            "examples/04/image.jpg",
     },
 }
 
@@ -45,48 +45,10 @@ def _validate_args(args):
 
     cfg = WAN_CONFIGS[args.task]
 
-    if args.sample_steps is None:
-        args.sample_steps = cfg.sample_steps
-
     if args.sample_shift is None:
         args.sample_shift = cfg.sample_shift
 
-    if args.sample_guide_scale is None:
-        args.sample_guide_scale = cfg.sample_guide_scale
-
-    if args.action_string is not None:
-        if args.action_path is None:
-            raise ValueError(
-                "--action_path is required when using --action_string "
-                "(directory must contain intrinsics.npy)."
-            )
-        from wan.utils.wasd_ijkl_to_c2ws import (
-            infer_frame_num_from_action_string,
-            pad_frame_num_to_4n_plus_1,
-        )
-
-        inferred_frames = infer_frame_num_from_action_string(args.action_string)
-        padded_frames = pad_frame_num_to_4n_plus_1(inferred_frames)
-        if padded_frames != inferred_frames:
-            logging.warning(
-                "Total frames implied by --action_string is %s, which does not satisfy 4n+1; "
-                "padding trailing 'none' frames to %s.",
-                inferred_frames,
-                padded_frames,
-            )
-            warnings.warn(
-                f"Total frames implied by --action_string is {inferred_frames}, "
-                f"which does not satisfy 4n+1; padding trailing 'none' frames to {padded_frames}.",
-                stacklevel=2,
-            )
-        args.allow_act2cam = True
-        if args.frame_num is not None and args.frame_num != padded_frames:
-            raise ValueError(
-                f"--frame_num ({args.frame_num}) must equal the total frames "
-                f"from --action_string after auto-padding ({padded_frames}), or omit --frame_num."
-            )
-        args.frame_num = padded_frames
-    elif args.frame_num is None:
+    if args.frame_num is None:
         args.frame_num = cfg.frame_num
 
     args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(
@@ -168,23 +130,6 @@ def _parse_args():
         default=False,
         help="Whether to use prompt extend.")
     parser.add_argument(
-        "--prompt_extend_method",
-        type=str,
-        default="local_qwen",
-        choices=["dashscope", "local_qwen"],
-        help="The prompt extend method to use.")
-    parser.add_argument(
-        "--prompt_extend_model",
-        type=str,
-        default=None,
-        help="The prompt extend model to use.")
-    parser.add_argument(
-        "--prompt_extend_target_lang",
-        type=str,
-        default="zh",
-        choices=["zh", "en"],
-        help="The target language of prompt extend.")
-    parser.add_argument(
         "--base_seed",
         type=int,
         default=42,
@@ -200,46 +145,36 @@ def _parse_args():
         default=None,
         help="The camera path to generate the video from.")
     parser.add_argument(
-        "--allow_act2cam",
-        action="store_true",
-        default=False,
-        help="Whether to allow action to camera conversion.")
-    parser.add_argument(
-        "--action_string",
-        type=str,
-        default=None,
-        help=(
-            "Compact keyboard schedule for allow_act2cam, e.g. "
-            "'w-3,iw-1,none-5,ijd-5' (whitespace removed). "
-            "Each segment is keys-<frame_count>; 'none' means no keys. "
-            "Requires --action_path for intrinsics.npy; implies --allow_act2cam "
-            "and sets --frame_num from the string unless it matches explicitly."
-        ),
-    )
-    parser.add_argument(
-        "--sample_solver",
-        type=str,
-        default='unipc',
-        choices=['unipc', 'dpm++'],
-        help="The solver used to sample.")
-    parser.add_argument(
-        "--sample_steps", type=int, default=None, help="The sampling steps.")
-    parser.add_argument(
         "--sample_shift",
         type=float,
         default=None,
         help="Sampling shift factor for flow matching schedulers.")
     parser.add_argument(
-        "--sample_guide_scale",
-        type=float,
-        default=None,
-        help="Classifier free guidance scale.")
-    parser.add_argument(
         "--convert_model_dtype",
         action="store_true",
         default=False,
         help="Whether to convert model paramerters dtype.")
-    
+    parser.add_argument(
+        "--local_attn_size",
+        type=int,
+        default=-1,
+        help='The local size of kv cache during inference')
+    parser.add_argument(
+        "--sink_size",
+        type=int,
+        default=0,
+        help='The sink size of kv cache during inference')
+    parser.add_argument(
+        "--max_attention_size",
+        type=int,
+        default=None,
+        help="The size of kv cache during inference.")
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default='output',
+        help="The path to the checkpoint directory.")
+
     args = parser.parse_args()
     _validate_args(args)
 
@@ -318,9 +253,9 @@ def generate(args):
             dist.broadcast_object_list(input_prompt, src=0)
         args.prompt = input_prompt[0]
         logging.info(f"Extended prompt: {args.prompt}")
-    
-    logging.info("Creating WanI2V pipeline.")
-    wan_i2v = wan.WanI2V(
+
+    logging.info("Creating WanI2VFast pipeline.")
+    wan_i2v = wan.WanI2VFast(
         config=cfg,
         checkpoint_dir=args.ckpt_dir,
         device_id=device,
@@ -330,30 +265,31 @@ def generate(args):
         use_sp=(args.ulysses_size > 1),
         t5_cpu=args.t5_cpu,
         convert_model_dtype=args.convert_model_dtype,
+        local_attn_size=args.local_attn_size,
+        sink_size=args.sink_size
     )
     logging.info("Generating video ...")
     video = wan_i2v.generate(
         args.prompt,
         img,
         action_path=args.action_path,
-        allow_act2cam=args.allow_act2cam,
-        action_string=args.action_string,
+        chunk_size=3,
         max_area=MAX_AREA_CONFIGS[args.size],
         frame_num=args.frame_num,
         shift=args.sample_shift,
-        sample_solver=args.sample_solver,
-        sampling_steps=args.sample_steps,
-        guide_scale=args.sample_guide_scale,
         seed=args.base_seed,
-        offload_model=args.offload_model)
+        offload_model=args.offload_model,
+        max_attention_size=args.max_attention_size)
 
     if rank == 0:
+        os.makedirs(args.save_dir, exist_ok=True)
         if args.save_file is None:
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             formatted_prompt = args.prompt.replace(" ", "_").replace("/",
                                                                      "_")[:50]
             suffix = '.mp4'
             args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}" + suffix
+            args.save_file = f'{args.save_dir}/{args.save_file}'
 
         logging.info(f"Saving generated video to {args.save_file}")
         save_video(

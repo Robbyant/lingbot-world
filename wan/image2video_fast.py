@@ -10,22 +10,18 @@ from functools import partial
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
+# import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
 from .distributed.fsdp import shard_model
-from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
+from .distributed.sequence_parallel import sp_attn_forward_causal, sp_dit_forward_causal
 from .distributed.util import get_world_size
-from .modules.model import WanModel
+from .modules.model_fast import WanModelFast
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
-from .utils.fm_solvers import (
-    FlowDPMSolverMultistepScheduler,
-    get_sampling_sigmas,
-    retrieve_timesteps,
-)
+
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.cam_utils import (
     compute_relative_poses,
@@ -35,13 +31,8 @@ from .utils.cam_utils import (
 )
 from einops import rearrange
 
-from wan.utils.wasd_ijkl_to_c2ws import wasd_array_to_frame_keys
-from wan.utils.wasd_ijkl_to_c2ws import generate_and_save_trajectory
-from wan.utils.wasd_ijkl_to_c2ws import action_string_to_wasd_ijkl
-from wan.utils.vis_utils import visualize_wasd_and_rotation_ui
 
-
-class WanI2V:
+class WanI2VFast:
 
     def __init__(
         self,
@@ -55,6 +46,9 @@ class WanI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        pipe_dtype=torch.bfloat16,
+        local_attn_size=-1,
+        sink_size=0,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -91,6 +85,9 @@ class WanI2V:
         self.num_train_timesteps = config.num_train_timesteps
         self.boundary = config.boundary
         self.param_dtype = config.param_dtype
+        self.pipe_dtype = pipe_dtype
+        self.local_attn_size = local_attn_size
+        self.sink_size = sink_size
 
         if t5_fsdp or dit_fsdp or use_sp:
             self.init_on_cpu = False
@@ -116,24 +113,27 @@ class WanI2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.low_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.low_noise_checkpoint, torch_dtype=torch.bfloat16, control_type=self.control_type)
-        self.low_noise_model = self._configure_model(
-            model=self.low_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+        logging.info(f"Creating WanModelFast from {checkpoint_dir}")
+        self.model = WanModelFast.from_pretrained(
+            checkpoint_dir,
+            subfolder=config.fast_noise_checkpoint,
+            torch_dtype=torch.bfloat16,
+            control_type=self.control_type,
+            local_attn_size=self.local_attn_size,
+            sink_size=self.sink_size)
 
-        self.high_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.high_noise_checkpoint, torch_dtype=torch.bfloat16, control_type=self.control_type)
-        self.high_noise_model = self._configure_model(
-            model=self.high_noise_model,
+        self.model = self._configure_model(
+            model=self.model,
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype).to(self.device)
+
+        self.scheduler = FlowUniPCMultistepScheduler(
+            num_train_timesteps=self.num_train_timesteps,
+            shift=1,
+            use_dynamic_shifting=False)
+
         if use_sp:
             self.sp_size = get_world_size()
         else:
@@ -169,8 +169,8 @@ class WanI2V:
         if use_sp:
             for block in model.blocks:
                 block.self_attn.forward = types.MethodType(
-                    sp_attn_forward, block.self_attn)
-            model.forward = types.MethodType(sp_dit_forward, model)
+                    sp_attn_forward_causal, block.self_attn)
+            model.forward = types.MethodType(sp_dit_forward_causal, model)
 
         if dist.is_initialized():
             dist.barrier()
@@ -185,56 +185,42 @@ class WanI2V:
 
         return model
 
-    def _prepare_model_for_timestep(self, t, boundary, offload_model):
-        r"""
-        Prepares and returns the required model for the current timestep.
-
-        Args:
-            t (torch.Tensor):
-                current timestep.
-            boundary (`int`):
-                The timestep threshold. If `t` is at or above this value,
-                the `high_noise_model` is considered as the required model.
-            offload_model (`bool`):
-                A flag intended to control the offloading behavior.
-
-        Returns:
-            torch.nn.Module:
-                The active model on the target device for the current timestep.
+    def _convert_flow_pred_to_x0(self, flow_pred: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor, scheduler) -> torch.Tensor:
         """
-        if t.item() >= boundary:
-            required_model_name = 'high_noise_model'
-            offload_model_name = 'low_noise_model'
-        else:
-            required_model_name = 'low_noise_model'
-            offload_model_name = 'high_noise_model'
-        if offload_model or self.init_on_cpu:
-            if next(getattr(
-                    self,
-                    offload_model_name).parameters()).device.type == 'cuda':
-                getattr(self, offload_model_name).to('cpu')
-            if next(getattr(
-                    self,
-                    required_model_name).parameters()).device.type == 'cpu':
-                getattr(self, required_model_name).to(self.device)
-        return getattr(self, required_model_name)
+        Convert flow matching's prediction to x0 prediction.
+        flow_pred: the prediction with shape [B, C, F, H, W]
+        xt: the input noisy data with shape [B, C, F, H, W]
+        timestep: the timestep with shape [B]
+
+        pred = noise - x0
+        x_t = (1-sigma_t) * x0 + sigma_t * noise
+        we have x0 = x_t - sigma_t * pred
+        """
+        # use higher precision for calculations
+        original_dtype = flow_pred.dtype
+        flow_pred, xt, sigmas, timesteps = map(
+            lambda x: x.double().to(flow_pred.device), [flow_pred, xt, scheduler.sigmas, scheduler.timesteps]
+        )
+        timestep_id = torch.argmin((timesteps - timestep).abs())
+        sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
+        x0_pred = xt - sigma_t * flow_pred
+
+        return x0_pred.to(original_dtype)
+
 
     def generate(self,
                  input_prompt,
                  img,
                  action_path=None,
-                 allow_act2cam=False,
-                 action_string=None,
-                 vis_ui=True,
-                 max_area=720 * 1280,
+                 chunk_size=3,
+                 max_area=480 * 832,
                  frame_num=81,
+                 timesteps_index=[0, 179, 358, 679],
                  shift=5.0,
-                 sample_solver='unipc',
-                 sampling_steps=40,
-                 guide_scale=5.0,
-                 n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 max_sequence_length=512,
+                 max_attention_size=None,):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -254,20 +240,10 @@ class WanI2V:
                 Solver used to sample the video.
             sampling_steps (`int`, *optional*, defaults to 40):
                 Number of diffusion sampling steps. Higher values improve quality but slow generation
-            guide_scale (`float` or tuple[`float`], *optional*, defaults 5.0):
-                Classifier-free guidance scale. Controls prompt adherence vs. creativity.
-                If tuple, the first guide_scale will be used for low noise model and
-                the second guide_scale will be used for high noise model.
-            n_prompt (`str`, *optional*, defaults to ""):
-                Negative prompt for content exclusion. If not given, use `config.sample_neg_prompt`
             seed (`int`, *optional*, defaults to -1):
                 Random seed for noise generation. If -1, use random seed
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
-            action_string (`str`, *optional*, defaults to None):
-                When set with ``allow_act2cam`` and ``action_path``, builds per-frame WASD/IJKL
-                from a compact string (e.g. ``w-3,iw-1,none-5``) instead of loading
-                ``wasd_action.npy`` / ``ijkl_action.npy``.
 
         Returns:
             torch.Tensor:
@@ -277,53 +253,25 @@ class WanI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width from max_area)
         """
-        if action_path is not None:
-            wasd_action = None
-            ijkl_action = None
-            wasd_action_for_vis = None
-            ijkl_action_for_vis = None
-            c2ws = None
-            if allow_act2cam:
-                assert self.control_type == "cam"
-                # For more precise control, we convert camera poses into wasd,ijkl actions and concatenate them with c2ws.
-                if action_string is not None:
-                    wasd_action, ijkl_action, str_frames = action_string_to_wasd_ijkl(
-                        action_string)
-                    if str_frames > frame_num:
-                        raise ValueError(
-                            f"action_string expands to {str_frames} frames but frame_num is {frame_num}"
-                        )
-                    if str_frames < frame_num:
-                        # frame_num may be auto-padded to 4n+1 in CLI; pad tail with no-key frames.
-                        pad_len = frame_num - str_frames
-                        wasd_action = np.pad(
-                            wasd_action, ((0, pad_len), (0, 0)), mode="constant")
-                        ijkl_action = np.pad(
-                            ijkl_action, ((0, pad_len), (0, 0)), mode="constant")
-                else:
-                    wasd_action = np.load(os.path.join(action_path, "wasd_action.npy"))  # wasd action
-                    ijkl_action = np.load(os.path.join(action_path, "ijkl_action.npy"))  # ijkl action
-                    wasd_action = wasd_action[:frame_num]
-                    ijkl_action = ijkl_action[:frame_num]
-                wasd_action_for_vis = wasd_action.copy()
-                ijkl_action_for_vis = ijkl_action.copy()
-                frame_keys = wasd_array_to_frame_keys(wasd_action, ijkl_action)
-                c2ws_from_act = generate_and_save_trajectory(frame_keys)
-                c2ws = np.array(c2ws_from_act)
-            else:
-                c2ws = np.load(os.path.join(action_path, "poses.npy")) # opencv coordinate
-                len_c2ws = ((len(c2ws) - 1) // 4) * 4 + 1
-                frame_num = min(frame_num, len_c2ws)
-                c2ws = c2ws[:frame_num]
 
-                if self.control_type == "act":
-                    # In 'act' mode, use rotation of c2ws to control orientation and wasd_action to drive movement.
-                    wasd_action = np.load(os.path.join(action_path, "action.npy")) # wasd action
-                    wasd_action = wasd_action[:frame_num]
+        if input_prompt is not None and isinstance(input_prompt, str):
+            batch_size = 1
+        elif input_prompt is not None and isinstance(input_prompt, list):
+            batch_size = len(input_prompt)
+        else:
+            batch_size = 1
+        if action_path is not None:
+            c2ws = np.load(os.path.join(action_path, "poses.npy")) # opencv coordinate
+            len_c2ws = ((len(c2ws) - 1) // 4) * 4 + 1
+            frame_num = ((frame_num - 1) // 4) * 4 + 1
+            frame_num = min(frame_num, len_c2ws)
+            c2ws = c2ws[:frame_num]
+            if self.control_type == 'act':
+                # In 'act' mode, use rotation of c2ws to control orientation and wasd_action to drive movement.
+                wasd_action = np.load(os.path.join(action_path, "action.npy")) # wasd action
+                wasd_action = wasd_action[:frame_num]
 
         # preprocess
-        guide_scale = (guide_scale, guide_scale) if isinstance(
-            guide_scale, float) else guide_scale
         img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
 
         F = frame_num
@@ -338,16 +286,17 @@ class WanI2V:
         h = lat_h * self.vae_stride[1]
         w = lat_w * self.vae_stride[2]
         lat_f = (F - 1) // self.vae_stride[0] + 1
-        max_seq_len = lat_f * lat_h * lat_w // (
+        lat_f = int(lat_f - (lat_f % chunk_size))
+        F = (lat_f - 1) * 4 + 1
+        max_seq_len = chunk_size * lat_h * lat_w // (
             self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
-
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
         noise = torch.randn(
             16,
-            (F - 1) // self.vae_stride[0] + 1,
+            lat_f,
             lat_h,
             lat_w,
             dtype=torch.float32,
@@ -363,21 +312,19 @@ class WanI2V:
         msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
         msk = msk.transpose(1, 2)[0]
 
-        if n_prompt == "":
-            n_prompt = self.sample_neg_prompt
+        # 2. Prepare timesteps
+        self.scheduler.set_timesteps(self.num_train_timesteps, shift=shift)
+        timesteps = self.scheduler.timesteps[timesteps_index]
 
         # preprocess
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
             if offload_model:
                 self.text_encoder.model.cpu()
         else:
             context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
 
         # cam preparation (only if action_path is provided)
         dit_cond_dict = None
@@ -393,13 +340,15 @@ class WanI2V:
                                     height_final=h,
                                     width_final=w)
             Ks = Ks[0]
-            
+
             len_c2ws = len(c2ws)
+            len_c2ws_ = int((len_c2ws - 1) // 4) + 1
+            len_c2ws_ = int(len_c2ws_ - (len_c2ws_ % chunk_size))
             c2ws_infer = interpolate_camera_poses(
                 src_indices=np.linspace(0, len_c2ws - 1, len_c2ws),
                 src_rot_mat=c2ws[:, :3, :3],
                 src_trans_vec=c2ws[:, :3, 3],
-                tgt_indices=np.linspace(0, len_c2ws - 1, int((len_c2ws - 1) // 4) + 1),
+                tgt_indices=np.linspace(0, len_c2ws - 1, len_c2ws_),
             )
             c2ws_infer = compute_relative_poses(c2ws_infer, framewise=True)
             Ks = Ks.repeat(len(c2ws_infer), 1)
@@ -431,9 +380,6 @@ class WanI2V:
                 wasd_action_tensor = wasd_action_tensor[None, ...] # [b, f*h*w, c]
                 wasd_action_tensor = rearrange(wasd_action_tensor, 'b (f h w) c -> b c f h w', f=lat_f, h=lat_h, w=lat_w).to(self.param_dtype)
                 c2ws_plucker_emb = torch.cat([c2ws_plucker_emb, wasd_action_tensor], dim=1)
-            dit_cond_dict = {
-                "c2ws_plucker_emb": c2ws_plucker_emb.chunk(1, dim=0),
-            }
 
         y = self.vae.encode([
             torch.concat([
@@ -450,129 +396,142 @@ class WanI2V:
         def noop_no_sync():
             yield
 
-        no_sync_low_noise = getattr(self.low_noise_model, 'no_sync',
-                                    noop_no_sync)
-        no_sync_high_noise = getattr(self.high_noise_model, 'no_sync',
-                                     noop_no_sync)
+        no_sync_model = getattr(self.model, 'no_sync', noop_no_sync)
 
+        # Initialize KV cache to all zeros
+        model_args = self.model.config
+        transformer_dtype = self.pipe_dtype
+        frame_seqlen = int(noise.shape[-2] * noise.shape[-1]// 4)
+        if self.local_attn_size > -1:
+            kv_size = frame_seqlen * self.local_attn_size
+        else:
+            kv_size = frame_seqlen * lat_f
+        head_dim = model_args.dim // model_args.num_heads
+        local_num_heads = model_args.num_heads // self.sp_size
+        self_kv_shape = [batch_size, kv_size, local_num_heads, head_dim]
+        self_kv_cache = self._initialize_self_kv_cache(num_layers=model_args.num_layers,
+                                                      shape=self_kv_shape,
+                                                      dtype=transformer_dtype,
+                                                      device=self.device)
+        cross_kv_shape = [batch_size, max_sequence_length, model_args.num_heads, head_dim]
+        cross_kv_cache = self._initialize_crossattn_cache(num_layers=model_args.num_layers,
+                                                         shape=cross_kv_shape,
+                                                         dtype=transformer_dtype,
+                                                         device=self.device)
         # evaluation mode
         with (
                 torch.amp.autocast('cuda', dtype=self.param_dtype),
                 torch.no_grad(),
-                no_sync_low_noise(),
-                no_sync_high_noise(),
+                no_sync_model(),
         ):
-            boundary = self.boundary * self.num_train_timesteps
-
-            if sample_solver == 'unipc':
-                sample_scheduler = FlowUniPCMultistepScheduler(
-                    num_train_timesteps=self.num_train_timesteps,
-                    shift=1,
-                    use_dynamic_shifting=False)
-                sample_scheduler.set_timesteps(
-                    sampling_steps, device=self.device, shift=shift)
-                timesteps = sample_scheduler.timesteps
-            elif sample_solver == 'dpm++':
-                sample_scheduler = FlowDPMSolverMultistepScheduler(
-                    num_train_timesteps=self.num_train_timesteps,
-                    shift=1,
-                    use_dynamic_shifting=False)
-                sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
-                timesteps, _ = retrieve_timesteps(
-                    sample_scheduler,
-                    device=self.device,
-                    sigmas=sampling_sigmas)
-            else:
-                raise NotImplementedError("Unsupported solver.")
-
             # sample videos
             latent = noise
+            latents_chunk = latent.split(chunk_size, dim=1) # [c, f, h, w]
+            condition_chunk = y.split(chunk_size, dim=1)
+            c2ws_plucker_emb_chunk = c2ws_plucker_emb.split(chunk_size, dim=2)
+            num_inference_chunk = len(latents_chunk)
+            pred_latent_chunks = []
+            for chunk_id in tqdm(range(num_inference_chunk)):
+                current_latent = latents_chunk[chunk_id]
+                current_condition = condition_chunk[chunk_id]
+                current_c2ws_plucker_emb = c2ws_plucker_emb_chunk[chunk_id]
 
-            arg_c = {
-                'context': [context[0]],
-                'seq_len': max_seq_len,
-                'y': [y],
-                'dit_cond_dict': dit_cond_dict,
-            }
+                dit_cond_dict = {
+                    "c2ws_plucker_emb": current_c2ws_plucker_emb.chunk(1, dim=0),
+                }
 
-            arg_null = {
-                'context': context_null,
-                'seq_len': max_seq_len,
-                'y': [y],
-                'dit_cond_dict': dit_cond_dict,
-            }
+                kwargs = {
+                    'context': [context[0]],
+                    'seq_len': max_seq_len,
+                    'y': [current_condition],
+                    'dit_cond_dict': dit_cond_dict,
+                    'kv_cache': self_kv_cache,
+                    'crossattn_cache': cross_kv_cache,
+                    'current_start': chunk_id * chunk_size * frame_seqlen,
+                    'max_attention_size': kv_size if max_attention_size is None else max_attention_size
+                }
 
-            if offload_model:
-                torch.cuda.empty_cache()
-
-            for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = [latent.to(self.device)]
-                timestep = [t]
-
-                timestep = torch.stack(timestep).to(self.device)
-
-                model = self._prepare_model_for_timestep(
-                    t, boundary, offload_model)
-                sample_guide_scale = guide_scale[1] if t.item(
-                ) >= boundary else guide_scale[0]
-
-                noise_pred_cond = model(
-                    latent_model_input, t=timestep, **arg_c)[0]
                 if offload_model:
                     torch.cuda.empty_cache()
-                noise_pred_uncond = model(
-                    latent_model_input, t=timestep, **arg_null)[0]
-                if offload_model:
-                    torch.cuda.empty_cache()
-                noise_pred = noise_pred_uncond + sample_guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
 
-                temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
-                    t,
-                    latent.unsqueeze(0),
-                    return_dict=False,
-                    generator=seed_g)[0]
-                latent = temp_x0.squeeze(0)
+                for timestep_idx in range(len(timesteps)):
+                    latent_model_input = [current_latent.to(self.device)]
+                    current_timestep = [timesteps[timestep_idx]]
 
-                x0 = [latent]
-                del latent_model_input, timestep
+                    timestep = torch.stack(current_timestep).to(self.device)
+
+                    noise_pred = self.model(
+                        x=latent_model_input, t=timestep, **kwargs)[0]
+
+                    if offload_model:
+                        torch.cuda.empty_cache()
+
+                    x0 = self._convert_flow_pred_to_x0(
+                        flow_pred=noise_pred,
+                        xt=current_latent,
+                        timestep=current_timestep[0],
+                        scheduler=self.scheduler,
+                    )
+
+                    if timestep_idx < len(timesteps) - 1:
+                        next_timestep = timesteps[timestep_idx + 1]
+                        current_latent = self.scheduler.add_noise(x0, torch.randn(x0.shape, generator=seed_g, device=x0.device, dtype=x0.dtype), next_timestep)
+                    else:
+                        # note return x0
+                        break
+
+                pred_latent_chunks.append(x0)
+
+                # Update kv cache
+                context_timestep = [timesteps[-1] * 0.0]
+                timestep = torch.stack(context_timestep).to(self.device)
+                self.model(x=[x0], t=timestep, **kwargs)
+
+            pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
 
             if offload_model:
-                self.low_noise_model.cpu()
-                self.high_noise_model.cpu()
+                self.model.cpu()
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
-                videos = self.vae.decode(x0)
+                videos = self.vae.decode([pred_latent_chunks])
 
-        del noise, latent, x0
-        del sample_scheduler
+        # del noise, latent, x0
+        # del sample_scheduler
         if offload_model:
             gc.collect()
             torch.cuda.synchronize()
         if dist.is_initialized():
             dist.barrier()
 
-        if self.rank == 0:
-            videos = videos[0]
-            if vis_ui and action_path is not None:
-                # videos format: (C, F, H, W), range (-1, 1)
-                # visualize_wasd_and_rotation_ui expects: (F, H, W, C), range (0, 1)
-                videos_np = videos.detach().cpu().numpy()
-                videos_np = np.transpose(videos_np, (1, 2, 3, 0))  # (C, F, H, W) -> (F, H, W, C)
-                videos_np = (videos_np + 1) / 2  # (-1, 1) -> (0, 1)
-                videos_np = visualize_wasd_and_rotation_ui(
-                            videos_np,
-                            c2ws,
-                            wasd_action_for_vis if wasd_action_for_vis is not None else wasd_action,
-                            ijkl_action_for_vis if ijkl_action_for_vis is not None else ijkl_action,
-                        )
-                # Convert back: (F, H, W, C) -> (C, F, H, W), (0, 1) -> (-1, 1)
-                videos_np = np.transpose(videos_np, (3, 0, 1, 2))  # (F, H, W, C) -> (C, F, H, W)
-                videos_np = videos_np * 2 - 1  # (0, 1) -> (-1, 1)
-                videos = torch.from_numpy(videos_np)
-        else:
-            videos = None
-        
-        return videos
+        return videos[0] if self.rank == 0 else None
+
+    def _initialize_self_kv_cache(self, num_layers, shape, dtype, device):
+        """
+        Initialize a Per-GPU KV cache for the SelfAttn.
+        """
+        self_kv_cache = []
+        for _ in range(num_layers):
+            self_kv_cache.append({
+                'k': torch.zeros(shape, dtype=dtype, device=device),
+                'v': torch.zeros(shape, dtype=dtype, device=device),
+                'global_end_index': torch.tensor([0], dtype=torch.long, device=device),
+                'local_end_index': torch.tensor([0], dtype=torch.long, device=device)
+            })
+
+        return self_kv_cache
+
+
+    def _initialize_crossattn_cache(self, num_layers, shape, dtype, device):
+        """
+        Initialize a per-GPU cross-attention cache.
+        """
+        crossattn_cache = []
+        for _ in range(num_layers):
+            crossattn_cache.append({
+                'k': torch.zeros(shape, dtype=dtype, device=device),
+                'v': torch.zeros(shape, dtype=dtype, device=device),
+                'is_init': torch.tensor(0, dtype=torch.int32, device=device),
+            })
+
+        return crossattn_cache
