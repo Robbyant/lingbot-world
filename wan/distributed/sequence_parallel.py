@@ -258,6 +258,8 @@ def sp_dit_forward_causal(
     crossattn_cache=None,
     current_start=0,
     max_attention_size=1_000_000,
+    frame_seqlen=None,
+    cross_attn_first_call=None,
 ):
     """
     x:                  A list of videos each with shape [C, T, H, W].
@@ -304,10 +306,14 @@ def sp_dit_forward_causal(
     assert seq_lens.max() <= seq_len
     x = torch.cat(x)
 
-    # Pad sequence to be divisible by world_size for SP chunking
+    # Pad sequence to be divisible by world_size for SP chunking.
+    # int(seq_lens) is one cudaStreamSynchronize; cache it once so each
+    # attention layer can reuse via the seq_lens_int kwarg instead of
+    # re-casting per-layer (32x).
     sp_size = get_world_size()
-    padded_seq_lens = int((seq_lens + sp_size - 1) // sp_size * sp_size)
-    sp_pad_len = padded_seq_lens - int(seq_lens)
+    seq_lens_int = int(seq_lens)
+    padded_seq_lens = ((seq_lens_int + sp_size - 1) // sp_size) * sp_size
+    sp_pad_len = padded_seq_lens - seq_lens_int
     if sp_pad_len > 0:
         x = torch.cat([x, x.new_zeros(x.size(0), sp_pad_len, x.size(2))], dim=1)
 
@@ -378,7 +384,10 @@ def sp_dit_forward_causal(
         context=context,
         context_lens=context_lens,
         dit_cond_dict=dit_cond_dict,
-        max_attention_size=max_attention_size)
+        max_attention_size=max_attention_size,
+        frame_seqlen=frame_seqlen,
+        cross_attn_first_call=cross_attn_first_call,
+        seq_lens_int=seq_lens_int)
 
     for block_index, block in enumerate(self.blocks):
         kwargs.update(
@@ -410,7 +419,9 @@ def sp_attn_forward_causal(
     freqs,
     kv_cache=None,
     current_start=0,
-    max_attention_size=1_000_000):
+    max_attention_size=1_000_000,
+    frame_seqlen=None,
+    seq_lens_int=None):
     r"""
     Sequence-parallel causal self-attention using Ulysses all-to-all.
 
@@ -457,9 +468,11 @@ def sp_attn_forward_causal(
 
     # padded_seq_lens = s * sp_size may exceed seq_lens due to SP padding
     padded_seq_lens = s * sp_size
-    seq_lens_int = int(seq_lens)
+    if seq_lens_int is None:
+        seq_lens_int = int(seq_lens)
 
-    frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+    if frame_seqlen is None:
+        frame_seqlen = math.prod(grid_sizes[0][1:]).item()
     current_start_frame = current_start // frame_seqlen
 
     # Apply causal RoPE on full (padded) sequence with local heads
@@ -475,7 +488,16 @@ def sp_attn_forward_causal(
 
     current_end = current_start + seq_lens
     kv_cache_size = kv_cache["k"].shape[1]
-    if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
+    if self.local_attn_size == -1:
+        # Fast path (no eviction possible — cache is global). Both indices
+        # advance identically every forward, so local_end_index ==
+        # current_end and local_start_index == current_start. Python ints
+        # via current_start (kwarg) + seq_lens_int — no .item() syncs.
+        local_end_index = current_start + seq_lens_int
+        local_start_index = current_start
+        kv_cache["k"][:, local_start_index:local_end_index] = key
+        kv_cache["v"][:, local_start_index:local_end_index] = v
+    elif (current_end > kv_cache["global_end_index"].item()) and (
             seq_lens + kv_cache["local_end_index"].item() > kv_cache_size):
         # Calculate the number of new tokens added in this step
         # Shift existing cache content left to discard oldest tokens
