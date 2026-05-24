@@ -12,6 +12,8 @@
 :: Usage:
 ::   download_fast.bat                       default (recommended)
 ::   download_fast.bat C:\my\path            override fast model local-dir
+::   download_fast.bat --force               redownload (cache hit ignored, links rebuilt)
+::   download_fast.bat C:\my\path --force    both
 ::
 :: All hardlinks/junctions are on the same NTFS volume, no admin required.
 
@@ -19,12 +21,26 @@ setlocal enableextensions enabledelayedexpansion
 cd /d "%~dp0"
 set PYTHONIOENCODING=utf-8
 
-:: ----- 1. download fast model -----
+:: ----- parse args (path + optional --force, in any order) -----
+set LOCAL_DIR=
+set FORCE_FLAG=
+:parse_args
+if "%~1"=="" goto args_done
+if /I "%~1"=="--force" (
+    set FORCE_FLAG=--force
+    shift
+    goto parse_args
+)
 set LOCAL_DIR=%~1
+shift
+goto parse_args
+:args_done
+
+:: ----- 1. download fast model -----
 if defined LOCAL_DIR (
-    python download.py --model fast --local-dir "%LOCAL_DIR%"
+    python download.py --model fast --local-dir "!LOCAL_DIR!" !FORCE_FLAG!
 ) else (
-    python download.py --model fast
+    python download.py --model fast !FORCE_FLAG!
 )
 if errorlevel 1 (
     echo.
@@ -47,6 +63,15 @@ for /f "delims=" %%S in ('dir /b /ad "%FAST_CACHE%" 2^>nul') do set SNAP=%FAST_C
 if not defined SNAP (
     echo ERROR: no snapshot inside %FAST_CACHE%
     exit /b 2
+)
+
+:: with --force, wipe existing links so they point at the freshly-downloaded snapshot
+if defined FORCE_FLAG (
+    echo --force: removing existing fast-mini-cam links
+    if exist "%DST%\models_t5_umt5-xxl-enc-bf16.pth" del /q "%DST%\models_t5_umt5-xxl-enc-bf16.pth"
+    if exist "%DST%\Wan2.1_VAE.pth" del /q "%DST%\Wan2.1_VAE.pth"
+    if exist "%DST%\google\umt5-xxl" rmdir "%DST%\google\umt5-xxl" 2>nul
+    if exist "%DST%\lingbot_world_fast" rmdir "%DST%\lingbot_world_fast" 2>nul
 )
 
 :: T5 (hardlink from snapshot — same NTFS volume)

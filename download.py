@@ -24,6 +24,11 @@ if __name__ == "__main__":
         default=None,
         help="Optional flat local directory. By default, model lands in the shared HF cache at ~/.cache/huggingface/hub/ — load with from_pretrained(repo_id) anywhere."
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-download even if files exist in cache (passes force_download=True to snapshot_download)."
+    )
 
     args = parser.parse_args()
 
@@ -36,7 +41,9 @@ if __name__ == "__main__":
             print(f"Local directory: {args.local_dir}")
         else:
             print(f"Cache directory: ~/.cache/huggingface/hub/")
+        if args.force:
+            print("Force re-download: ON")
         print()
 
-        path = snapshot_download(repo_id=repo_id, local_dir=args.local_dir)
+        path = snapshot_download(repo_id=repo_id, local_dir=args.local_dir, force_download=args.force)
         print(f"Model '{model}' available at {path}")
