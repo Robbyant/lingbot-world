@@ -85,15 +85,21 @@ class CausalWanSelfAttention(nn.Module):
         freqs,
         kv_cache=None,
         current_start=0,
-        max_attention_size=1_000_000
+        max_attention_size=1_000_000,
+        frame_seqlen=None,
+        seq_lens_int=None,
     ):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
-            block_mask (BlockMask)
+            frame_seqlen(int, optional): Pre-computed H*W/(patch_h*patch_w). If
+                provided, skips a `.item()` sync on `grid_sizes`.
+            seq_lens_int(int, optional): Accepted for signature parity with
+                the SP path (sp_attn_forward_causal). Unused here.
         """
+        del seq_lens_int
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
         # query, key, value function
@@ -105,7 +111,8 @@ class CausalWanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+        if frame_seqlen is None:
+            frame_seqlen = math.prod(grid_sizes[0][1:]).item()
         current_start_frame = current_start // frame_seqlen
         roped_query = causal_rope_apply(q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
         roped_key = causal_rope_apply(k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
@@ -114,7 +121,16 @@ class CausalWanSelfAttention(nn.Module):
         # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
         kv_cache_size = kv_cache["k"].shape[1]
         num_new_tokens = roped_query.shape[1]
-        if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
+        if self.local_attn_size == -1:
+            # Fast path (no eviction possible — cache is global). Both
+            # indices start at 0 and advance identically every forward, so
+            # local_end_index == current_end and local_start_index ==
+            # current_start. All Python ints — no .item() syncs.
+            local_end_index = current_end
+            local_start_index = current_start
+            kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+            kv_cache["v"][:, local_start_index:local_end_index] = v
+        elif (current_end > kv_cache["global_end_index"].item()) and (
                 num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
             # Calculate the number of new tokens added in this step
             # Shift existing cache content left to discard oldest tokens
@@ -153,12 +169,17 @@ class CausalWanSelfAttention(nn.Module):
 
 class WanCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens, crossattn_cache=None):
+    def forward(self, x, context, context_lens, crossattn_cache=None,
+                cross_attn_first_call=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
+            cross_attn_first_call(bool, optional): If provided, used as the
+                "first call this generation" gate instead of reading
+                crossattn_cache["is_init"].item() (which forces a CPU↔GPU
+                sync). Caller (pipeline) tracks this as a Python bool.
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
@@ -166,7 +187,11 @@ class WanCrossAttention(WanSelfAttention):
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
 
         if crossattn_cache is not None:
-            if crossattn_cache["is_init"].item() == 0:
+            if cross_attn_first_call is None:
+                is_first = crossattn_cache["is_init"].item() == 0
+            else:
+                is_first = cross_attn_first_call
+            if is_first:
                 crossattn_cache["is_init"].fill_(1)
                 k = self.norm_k(self.k(context)).view(b, -1, n, d)
                 v = self.v(context).view(b, -1, n, d)
@@ -246,7 +271,10 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        max_attention_size=1_000_000
+        max_attention_size=1_000_000,
+        frame_seqlen=None,
+        cross_attn_first_call=None,
+        seq_lens_int=None,
     ):
         r"""
         Args:
@@ -262,7 +290,8 @@ class CausalWanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size)
+            seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,
+            frame_seqlen=frame_seqlen, seq_lens_int=seq_lens_int)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -276,16 +305,19 @@ class CausalWanAttentionBlock(nn.Module):
             x = (1.0 + cam_scale) * x + cam_shift
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens, 
-                                    crossattn_cache=crossattn_cache)
+        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None,
+                           cross_attn_first_call=None):
+            x = x + self.cross_attn(self.norm3(x), context, context_lens,
+                                    crossattn_cache=crossattn_cache,
+                                    cross_attn_first_call=cross_attn_first_call)
             y = self.ffn(
                 self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
             with torch.amp.autocast('cuda', dtype=torch.float32):
                 x = x + y * e[5].squeeze(2)
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
+        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache,
+                           cross_attn_first_call=cross_attn_first_call)
         return x
 
 
@@ -468,7 +500,9 @@ class WanModelFast(ModelMixin, ConfigMixin):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        max_attention_size=1_000_000
+        max_attention_size=1_000_000,
+        frame_seqlen=None,
+        cross_attn_first_call=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -580,7 +614,9 @@ class WanModelFast(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens,
             dit_cond_dict=dit_cond_dict,
-            max_attention_size=max_attention_size)
+            max_attention_size=max_attention_size,
+            frame_seqlen=frame_seqlen,
+            cross_attn_first_call=cross_attn_first_call)
 
         for block_index, block in enumerate(self.blocks):
             kwargs.update(
