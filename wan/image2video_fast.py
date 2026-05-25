@@ -410,7 +410,7 @@ class WanI2VFast:
                 - C: Color channels (3 for RGB)
                 - N: Number of frames (81)
                 - H: Frame height (from max_area)
-                - W: Frame width from max_area)
+                - W: Frame width (from max_area)
         """
 
         if input_prompt is not None and isinstance(input_prompt, str):
