@@ -212,6 +212,8 @@ def _parse_args():
             "Compact keyboard schedule for allow_act2cam, e.g. "
             "'w-3,iw-1,none-5,ijd-5' (whitespace removed). "
             "Each segment is keys-<frame_count>; 'none' means no keys. "
+            "WASD maps to forward/left/backward/right movement and "
+            "IJKL maps to pitch-up/yaw-left/pitch-down/yaw-right rotation. "
             "Requires --action_path for intrinsics.npy; implies --allow_act2cam "
             "and sets --frame_num from the string unless it matches explicitly."
         ),

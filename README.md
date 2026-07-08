@@ -115,6 +115,7 @@ Before running inference, you need to prepare:
 - Control signals (optional, can be generated from a video using [ViPE](https://github.com/nv-tlabs/vipe))
   - `intrinsics.npy`: Shape `[num_frames, 4]`, where the 4 values represent `[fx, fy, cx, cy]`
   - `poses.npy`: Shape `[num_frames, 4, 4]`, where each `[4, 4]` represents a transformation matrix in OpenCV coordinates
+  - If the source video contains UI overlays such as keyboard hints or arrows, crop them out before running ViPE so the estimated camera trajectory is not dominated by the overlay.
 
 We provide the following reference inference scripts:
 - `LingBot-World-Base (Cam)`:
@@ -139,6 +140,38 @@ We provide the following reference inference scripts:
   ``` sh
   torchrun --nproc_per_node=8 generate.py --task i2v-A14B --size 480*832 --ckpt_dir lingbot-world-base-cam --image examples/05/image.jpg --action_path examples/05 --action_string "w-10,a-10,d-10,iw-15,none-10,j-10,l-10,s-15" --allow_act2cam --sample_steps 20 --dit_fsdp --t5_fsdp --ulysses_size 8 --prompt "The video presents a soaring journey through a fantasy jungle. The wind whips past the rider's blue hands gripping the reins, causing the leather straps to vibrate. The ancient gothic castle approaches steadily, its stone details becoming clearer against the backdrop of floating islands and distant waterfalls."
   ```
+
+#### Action string control
+
+`--action_string` is a compact keyboard schedule for `LingBot-World-Base (Act)`.
+Each comma-separated segment uses `<keys>-<frame_count>`, and `none` means no
+key is active for that segment:
+
+```text
+w-10,a-10,d-10,iw-15,none-10,j-10,l-10,s-15
+```
+
+Multiple keys can be combined in the same segment, so `iw-15` means pressing
+`i` and `w` together for 15 frames. The key columns match the saved action
+arrays:
+
+| Array | Columns | Meaning |
+| :--- | :--- | :--- |
+| `wasd_action.npy` | `[w, a, s, d]` | forward, left, backward, right movement on the ground plane |
+| `ijkl_action.npy` | `[i, j, k, l]` | pitch up, yaw left, pitch down, yaw right |
+
+Internally, the helper converts the key schedule into camera poses with a
+translation step of `0.05` and a rotation step of `2` degrees per frame, with
+pitch clamped to `85` degrees. The final motion is still conditioned jointly by
+the input image, prompt, model weights, and sampling settings.
+
+When `--action_string` is provided:
+- `--action_path` is still required because it provides `intrinsics.npy`.
+- `--allow_act2cam` is enabled automatically.
+- `--frame_num` is inferred from the segment lengths and padded with trailing
+  `none` frames until it satisfies `4n+1`. If `--frame_num` is provided
+  explicitly, it must match the padded value.
+
 Tips:
 If you have sufficient CUDA memory, you may increase the `frame_num` parameter to a value such as 961 to generate a one-minute video at 16 FPS. Otherwise if the CUDA memory is not sufficient, you may use ``--t5_cpu`` to decrease the memory usage.
 
