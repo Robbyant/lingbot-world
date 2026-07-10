@@ -19,10 +19,19 @@ def shard_model(
     sync_module_states=True,
     use_lora=False
 ):
+    # Inference-only optimization: keep parameters gathered after the
+    # first forward. FSDP1's equivalent of FSDP2's reshard_after_forward=False
+    # is ShardingStrategy.SHARD_GRAD_OP — only grads/optimizer state are
+    # sharded; params are unsharded after the first all-gather and stay
+    # resident across forwards. Memory cost: ~28GB unsharded params per
+    # rank (vs ~3.5GB sharded across 8 ranks), but at 80GB H100 we have
+    # headroom. Profiling identified AllGather as 91% of NCCL time
+    # (975 ms / 2-chunk window) — skipping the per-forward re-gather
+    # across the 35 forwards in a generate() should reclaim most of it.
     model = FSDP(
         module=model,
         process_group=process_group,
-        sharding_strategy=sharding_strategy,
+        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
         auto_wrap_policy=partial(
             lambda_auto_wrap_policy, lambda_fn=lambda m: m in model.blocks),
         mixed_precision=MixedPrecision(

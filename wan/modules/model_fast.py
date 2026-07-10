@@ -88,6 +88,7 @@ class CausalWanSelfAttention(nn.Module):
         max_attention_size=1_000_000,
         frame_seqlen=None,
         seq_lens_int=None,
+        kv_write_index=None,
     ):
         r"""
         Args:
@@ -98,6 +99,13 @@ class CausalWanSelfAttention(nn.Module):
                 provided, skips a `.item()` sync on `grid_sizes`.
             seq_lens_int(int, optional): Accepted for signature parity with
                 the SP path (sp_attn_forward_causal). Unused here.
+            kv_write_index(LongTensor, optional): Pre-built index tensor of
+                shape [seq_lens] holding positions [current_start ...
+                current_end-1]. When provided, the fast-path uses
+                `index_copy_` instead of Python-int slice indexing — graph-
+                stable across chunks (the tensor's *contents* vary, but its
+                shape is fixed, so torch.compile / CUDA Graphs treats it as
+                one input rather than triggering per-chunk recompiles).
         """
         del seq_lens_int
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
@@ -125,11 +133,19 @@ class CausalWanSelfAttention(nn.Module):
             # Fast path (no eviction possible — cache is global). Both
             # indices start at 0 and advance identically every forward, so
             # local_end_index == current_end and local_start_index ==
-            # current_start. All Python ints — no .item() syncs.
+            # current_start.
             local_end_index = current_end
             local_start_index = current_start
-            kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-            kv_cache["v"][:, local_start_index:local_end_index] = v
+            if kv_write_index is not None:
+                # Graph-stable write: index is a tensor input. No Python int
+                # in the slice → torch.compile / CUDA Graphs can capture
+                # this forward once and replay across chunks.
+                kv_cache["k"].index_copy_(1, kv_write_index, roped_key)
+                kv_cache["v"].index_copy_(1, kv_write_index, v)
+            else:
+                # Eager fallback for callers that don't pass kv_write_index.
+                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                kv_cache["v"][:, local_start_index:local_end_index] = v
         elif (current_end > kv_cache["global_end_index"].item()) and (
                 num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
             # Calculate the number of new tokens added in this step
@@ -275,6 +291,7 @@ class CausalWanAttentionBlock(nn.Module):
         frame_seqlen=None,
         cross_attn_first_call=None,
         seq_lens_int=None,
+        kv_write_index=None,
     ):
         r"""
         Args:
@@ -291,7 +308,8 @@ class CausalWanAttentionBlock(nn.Module):
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
             seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,
-            frame_seqlen=frame_seqlen, seq_lens_int=seq_lens_int)
+            frame_seqlen=frame_seqlen, seq_lens_int=seq_lens_int,
+            kv_write_index=kv_write_index)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -503,6 +521,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
         max_attention_size=1_000_000,
         frame_seqlen=None,
         cross_attn_first_call=None,
+        kv_write_index=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -616,7 +635,8 @@ class WanModelFast(ModelMixin, ConfigMixin):
             dit_cond_dict=dit_cond_dict,
             max_attention_size=max_attention_size,
             frame_seqlen=frame_seqlen,
-            cross_attn_first_call=cross_attn_first_call)
+            cross_attn_first_call=cross_attn_first_call,
+            kv_write_index=kv_write_index)
 
         for block_index, block in enumerate(self.blocks):
             kwargs.update(

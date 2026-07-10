@@ -260,6 +260,7 @@ def sp_dit_forward_causal(
     max_attention_size=1_000_000,
     frame_seqlen=None,
     cross_attn_first_call=None,
+    kv_write_index=None,
 ):
     """
     x:                  A list of videos each with shape [C, T, H, W].
@@ -285,7 +286,9 @@ def sp_dit_forward_causal(
     updates the KV cache, runs attention, then all-to-all back.
     """
 
-    assert len(x) == 1
+    # B>1 batched inference (E3 probe): assertion lifted. Downstream uses
+    # of seq_lens / grid_sizes assume homogeneous shape across batch.
+    # assert len(x) == 1
 
     if self.model_type == 'i2v':
         assert y is not None
@@ -319,7 +322,12 @@ def sp_dit_forward_causal(
 
     # time embeddings
     if t.dim() == 1:
-        t = t.expand(t.size(0), padded_seq_lens)
+        # E3: was `t.expand(t.size(0), padded_seq_lens)`, which only works
+        # when t is shape [1] (singleton expandable to anything). For B>1
+        # t is shape [B] and expand fails — add a unit dim first so the
+        # broadcast is [B, 1] → [B, padded_seq_lens]. Identical to the
+        # original at B=1.
+        t = t.unsqueeze(1).expand(t.size(0), padded_seq_lens)
     with torch.amp.autocast('cuda', dtype=torch.float32):
         bt = t.size(0)
         t = t.flatten()
@@ -349,8 +357,11 @@ def sp_dit_forward_causal(
                 c3=self.patch_size[2],
             ) for i in c2ws_plucker_emb
         ]
-        c2ws_plucker_emb = torch.cat(c2ws_plucker_emb,
-                                     dim=1)  # [1, (L1+...+Ln), C]
+        # E3: cat along batch dim. For B=1 (one element in the list) this
+        # is a no-op vs the original dim=1; for B>1 (multi-user) each user
+        # keeps its own camera conditioning instead of being merged into
+        # one batch=1 sequence.
+        c2ws_plucker_emb = torch.cat(c2ws_plucker_emb, dim=0)  # [B, L, C]
         c2ws_plucker_emb = self.patch_embedding_wancamctrl(c2ws_plucker_emb)
         c2ws_hidden_states = self.c2ws_hidden_states_layer2(
             torch_F.silu(self.c2ws_hidden_states_layer1(c2ws_plucker_emb)))
@@ -387,7 +398,8 @@ def sp_dit_forward_causal(
         max_attention_size=max_attention_size,
         frame_seqlen=frame_seqlen,
         cross_attn_first_call=cross_attn_first_call,
-        seq_lens_int=seq_lens_int)
+        seq_lens_int=seq_lens_int,
+        kv_write_index=kv_write_index)
 
     for block_index, block in enumerate(self.blocks):
         kwargs.update(
@@ -421,7 +433,8 @@ def sp_attn_forward_causal(
     current_start=0,
     max_attention_size=1_000_000,
     frame_seqlen=None,
-    seq_lens_int=None):
+    seq_lens_int=None,
+    kv_write_index=None):
     r"""
     Sequence-parallel causal self-attention using Ulysses all-to-all.
 
@@ -491,12 +504,19 @@ def sp_attn_forward_causal(
     if self.local_attn_size == -1:
         # Fast path (no eviction possible — cache is global). Both indices
         # advance identically every forward, so local_end_index ==
-        # current_end and local_start_index == current_start. Python ints
-        # via current_start (kwarg) + seq_lens_int — no .item() syncs.
+        # current_end and local_start_index == current_start.
         local_end_index = current_start + seq_lens_int
         local_start_index = current_start
-        kv_cache["k"][:, local_start_index:local_end_index] = key
-        kv_cache["v"][:, local_start_index:local_end_index] = v
+        if kv_write_index is not None:
+            # Graph-stable write: index is a tensor input (shape fixed,
+            # contents vary per chunk). Lets torch.compile capture this
+            # forward once and replay across chunks instead of recompiling
+            # per current_start.
+            kv_cache["k"].index_copy_(1, kv_write_index, key)
+            kv_cache["v"].index_copy_(1, kv_write_index, v)
+        else:
+            kv_cache["k"][:, local_start_index:local_end_index] = key
+            kv_cache["v"][:, local_start_index:local_end_index] = v
     elif (current_end > kv_cache["global_end_index"].item()) and (
             seq_lens + kv_cache["local_end_index"].item() > kv_cache_size):
         # Calculate the number of new tokens added in this step
