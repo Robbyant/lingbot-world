@@ -285,6 +285,9 @@ class WanI2VFast:
                 current_start=0,
                 max_attention_size=kv_size,
                 frame_seqlen=frame_seqlen,
+                kv_write_index=torch.arange(
+                    0, chunk_size * frame_seqlen,
+                    device=self.device, dtype=torch.long),
             )
 
         if dist.is_initialized():
@@ -611,6 +614,15 @@ class WanI2VFast:
                     "c2ws_plucker_emb": current_c2ws_plucker_emb.chunk(1, dim=0),
                 }
 
+                current_start_int = chunk_id * chunk_size * frame_seqlen
+                current_end_int = current_start_int + chunk_size * frame_seqlen
+                # Pre-built KV-write index. Shape [seq_lens] is fixed; only
+                # the contents shift per chunk. Lets the inner attention
+                # forward use index_copy_ instead of Python-int slice
+                # indexing, which is the gate to torch.compile / CUDA Graphs.
+                kv_write_index = torch.arange(
+                    current_start_int, current_end_int,
+                    device=self.device, dtype=torch.long)
                 kwargs = {
                     'context': [context[0]],
                     'seq_len': max_seq_len,
@@ -618,9 +630,10 @@ class WanI2VFast:
                     'dit_cond_dict': dit_cond_dict,
                     'kv_cache': self_kv_cache,
                     'crossattn_cache': cross_kv_cache,
-                    'current_start': chunk_id * chunk_size * frame_seqlen,
+                    'current_start': current_start_int,
                     'max_attention_size': kv_size if max_attention_size is None else max_attention_size,
                     'frame_seqlen': frame_seqlen,
+                    'kv_write_index': kv_write_index,
                 }
 
                 if offload_model:

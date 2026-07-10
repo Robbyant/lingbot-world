@@ -260,6 +260,7 @@ def sp_dit_forward_causal(
     max_attention_size=1_000_000,
     frame_seqlen=None,
     cross_attn_first_call=None,
+    kv_write_index=None,
 ):
     """
     x:                  A list of videos each with shape [C, T, H, W].
@@ -387,7 +388,8 @@ def sp_dit_forward_causal(
         max_attention_size=max_attention_size,
         frame_seqlen=frame_seqlen,
         cross_attn_first_call=cross_attn_first_call,
-        seq_lens_int=seq_lens_int)
+        seq_lens_int=seq_lens_int,
+        kv_write_index=kv_write_index)
 
     for block_index, block in enumerate(self.blocks):
         kwargs.update(
@@ -421,7 +423,8 @@ def sp_attn_forward_causal(
     current_start=0,
     max_attention_size=1_000_000,
     frame_seqlen=None,
-    seq_lens_int=None):
+    seq_lens_int=None,
+    kv_write_index=None):
     r"""
     Sequence-parallel causal self-attention using Ulysses all-to-all.
 
@@ -491,12 +494,19 @@ def sp_attn_forward_causal(
     if self.local_attn_size == -1:
         # Fast path (no eviction possible — cache is global). Both indices
         # advance identically every forward, so local_end_index ==
-        # current_end and local_start_index == current_start. Python ints
-        # via current_start (kwarg) + seq_lens_int — no .item() syncs.
+        # current_end and local_start_index == current_start.
         local_end_index = current_start + seq_lens_int
         local_start_index = current_start
-        kv_cache["k"][:, local_start_index:local_end_index] = key
-        kv_cache["v"][:, local_start_index:local_end_index] = v
+        if kv_write_index is not None:
+            # Graph-stable write: index is a tensor input (shape fixed,
+            # contents vary per chunk). Lets torch.compile capture this
+            # forward once and replay across chunks instead of recompiling
+            # per current_start.
+            kv_cache["k"].index_copy_(1, kv_write_index, key)
+            kv_cache["v"].index_copy_(1, kv_write_index, v)
+        else:
+            kv_cache["k"][:, local_start_index:local_end_index] = key
+            kv_cache["v"][:, local_start_index:local_end_index] = v
     elif (current_end > kv_cache["global_end_index"].item()) and (
             seq_lens + kv_cache["local_end_index"].item() > kv_cache_size):
         # Calculate the number of new tokens added in this step
