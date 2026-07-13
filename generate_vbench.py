@@ -1,9 +1,16 @@
 import argparse
+import csv
+import json
 import logging
 import os
+import re
 import sys
+import time
 import warnings
 from datetime import datetime
+
+# Disable torch compile to avoid inductor import errors
+os.environ['TORCHDYNAMO_DISABLE'] = '1'
 
 warnings.filterwarnings('ignore')
 
@@ -17,6 +24,14 @@ import wan
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.distributed.util import init_distributed_group
 from wan.utils.utils import merge_video_audio, save_video, str2bool
+
+
+_SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
+_VBENCH_ROOT       = os.path.join(_SCRIPT_DIR, "..", "VBench", "vbench2_beta_i2v")
+_DEFAULT_INFO_JSON = os.path.join(_VBENCH_ROOT, "vbench2_i2v_full_info.json")
+_DEFAULT_CROP_DIR  = os.path.join(_VBENCH_ROOT, "vbench2_beta_i2v", "data", "crop")
+def _safe(s):
+    return re.sub(r'[<>:"/\\|?*]', "_", s)[:150]
 
 
 EXAMPLE_PROMPT = {
@@ -54,39 +69,7 @@ def _validate_args(args):
     if args.sample_guide_scale is None:
         args.sample_guide_scale = cfg.sample_guide_scale
 
-    if args.action_string is not None:
-        if args.action_path is None:
-            raise ValueError(
-                "--action_path is required when using --action_string "
-                "(directory must contain intrinsics.npy)."
-            )
-        from wan.utils.wasd_ijkl_to_c2ws import (
-            infer_frame_num_from_action_string,
-            pad_frame_num_to_4n_plus_1,
-        )
-
-        inferred_frames = infer_frame_num_from_action_string(args.action_string)
-        padded_frames = pad_frame_num_to_4n_plus_1(inferred_frames)
-        if padded_frames != inferred_frames:
-            logging.warning(
-                "Total frames implied by --action_string is %s, which does not satisfy 4n+1; "
-                "padding trailing 'none' frames to %s.",
-                inferred_frames,
-                padded_frames,
-            )
-            warnings.warn(
-                f"Total frames implied by --action_string is {inferred_frames}, "
-                f"which does not satisfy 4n+1; padding trailing 'none' frames to {padded_frames}.",
-                stacklevel=2,
-            )
-        args.allow_act2cam = True
-        if args.frame_num is not None and args.frame_num != padded_frames:
-            raise ValueError(
-                f"--frame_num ({args.frame_num}) must equal the total frames "
-                f"from --action_string after auto-padding ({padded_frames}), or omit --frame_num."
-            )
-        args.frame_num = padded_frames
-    elif args.frame_num is None:
+    if args.frame_num is None:
         args.frame_num = cfg.frame_num
 
     args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(
@@ -118,8 +101,8 @@ def _parse_args():
     parser.add_argument(
         "--frame_num",
         type=int,
-        default=None,
-        help="How many frames of video are generated. The number should be 4n+1"
+        default=81,
+        help="How many frames of video are generated. The number should be 4n+1 (default: 81)"
     )
     parser.add_argument(
         "--ckpt_dir",
@@ -130,8 +113,7 @@ def _parse_args():
         "--offload_model",
         type=str2bool,
         default=None,
-        help="Whether to offload the model to CPU after each model forward, reducing GPU memory usage."
-    )
+        help="Whether to offload the model to CPU after each model forward, reducing GPU memory usage.")
     parser.add_argument(
         "--ulysses_size",
         type=int,
@@ -200,23 +182,6 @@ def _parse_args():
         default=None,
         help="The camera path to generate the video from.")
     parser.add_argument(
-        "--allow_act2cam",
-        action="store_true",
-        default=False,
-        help="Whether to allow action to camera conversion.")
-    parser.add_argument(
-        "--action_string",
-        type=str,
-        default=None,
-        help=(
-            "Compact keyboard schedule for allow_act2cam, e.g. "
-            "'w-3,iw-1,none-5,ijd-5' (whitespace removed). "
-            "Each segment is keys-<frame_count>; 'none' means no keys. "
-            "Requires --action_path for intrinsics.npy; implies --allow_act2cam "
-            "and sets --frame_num from the string unless it matches explicitly."
-        ),
-    )
-    parser.add_argument(
         "--sample_solver",
         type=str,
         default='unipc',
@@ -239,65 +204,29 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether to convert model paramerters dtype.")
-    parser.add_argument(
-        "--overlay_actions",
-        action="store_true",
-        default=False,
-        help="Draw WASD key state overlay on output frames (requires --action_path).")
+    # ---- VBench batch args ----
+    parser.add_argument("--vbench", action="store_true", default=True,
+        help="Run VBench batch generation instead of single-video mode.")
+    parser.add_argument("--image_types", type=str, default="indoor,scenery",
+        help="Comma-separated image_type values to include (default: scenery,indoor).")
+    parser.add_argument("--vbench_output_dir", type=str, default="results_vbench/videos",
+        help="Output directory for vbench videos.")
+    parser.add_argument("--num_samples", type=int, default=5,
+        help="Number of samples per prompt.")
+    parser.add_argument("--vbench_info_json", type=str, default=None,
+        help="Path to vbench2_i2v_full_info.json.")
+    parser.add_argument("--crop_dir", type=str, default=None,
+        help="Path to VBench crop directory.")
+    parser.add_argument("--resolution", type=str, default="1-1",
+        help="Crop resolution subfolder.")
 
     args = parser.parse_args()
-    _validate_args(args)
+    if args.vbench:
+        assert args.ckpt_dir is not None, "Please specify --ckpt_dir (path to Wan checkpoint directory)."
+    else:
+        _validate_args(args)
 
     return args
-
-
-def _apply_action_overlay(video, action_data):
-    """Draw WASD key state overlay on each frame.
-
-    Args:
-        video:       tensor [C, F, H, W] in range [-1, 1]
-        action_data: ndarray [N, 4] binary int — columns map to W, A, S, D
-
-    Returns:
-        tensor [C, F, H, W] in range [-1, 1]
-    """
-    import numpy as np
-    from PIL import Image, ImageDraw
-
-    # [C,F,H,W] -> [F,H,W,C] uint8
-    frames = ((video.permute(1, 2, 3, 0).clamp(-1, 1) + 1) * 127.5).byte().cpu().numpy()
-    F = frames.shape[0]
-    indices = (np.linspace(0, len(action_data) - 1, F) + 0.5).astype(int).clip(0, len(action_data) - 1)
-
-    sz, gap = 28, 4  # key box size and gap
-    x0, y0 = 10, 10
-    # WASD cross layout:
-    #     [W]
-    # [A][S][D]
-    key_positions = [
-        ('W', x0 + sz + gap,       y0),
-        ('A', x0,                   y0 + sz + gap),
-        ('S', x0 + sz + gap,        y0 + sz + gap),
-        ('D', x0 + 2 * (sz + gap),  y0 + sz + gap),
-    ]
-
-    result = []
-    for i, frame in enumerate(frames):
-        img = Image.fromarray(frame)
-        draw = ImageDraw.Draw(img, 'RGBA')
-        acts = action_data[indices[i]]
-        for k, (label, kx, ky) in enumerate(key_positions):
-            pressed = bool(acts[k]) if k < len(acts) else False
-            fill = (255, 220, 0, 210) if pressed else (40, 40, 40, 160)
-            text_col = (0, 0, 0, 255) if pressed else (150, 150, 150, 255)
-            draw.rounded_rectangle([kx, ky, kx + sz, ky + sz], radius=4, fill=fill)
-            bbox = draw.textbbox((0, 0), label)
-            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            draw.text((kx + (sz - tw) // 2, ky + (sz - th) // 2 - 1), label, fill=text_col)
-        result.append(np.array(img))
-
-    out = torch.from_numpy(np.stack(result)).float()  # [F, H, W, C]
-    return (out / 127.5 - 1).permute(3, 0, 1, 2)     # [C, F, H, W]
 
 
 def _init_logging(rank):
@@ -319,17 +248,21 @@ def generate(args):
     device = local_rank
     _init_logging(rank)
 
+    logging.info("Starting the generation process...")
+    
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
     if world_size > 1:
+        logging.info("Initializing distributed environment...")
         torch.cuda.set_device(local_rank)
         dist.init_process_group(
             backend="nccl",
             init_method="env://",
             rank=rank,
             world_size=world_size)
+        logging.info("Distributed environment initialized.")
     else:
         assert not (
             args.t5_fsdp or args.dit_fsdp
@@ -342,6 +275,7 @@ def generate(args):
         assert args.ulysses_size == world_size, f"The number of ulysses_size should be equal to the world size."
         init_distributed_group()
 
+    logging.info("Loading model configuration...")
     cfg = WAN_CONFIGS[args.task]
     if args.ulysses_size > 1:
         assert cfg.num_heads % args.ulysses_size == 0, f"`{cfg.num_heads=}` cannot be divided evenly by `{args.ulysses_size=}`."
@@ -357,12 +291,13 @@ def generate(args):
     logging.info(f"Input prompt: {args.prompt}")
     img = None
     if args.image is not None:
+        logging.info(f"Loading input image from {args.image}...")
         img = Image.open(args.image).convert("RGB")
-        logging.info(f"Input image: {args.image}")
+        logging.info("Input image loaded.")
 
     # prompt extend
     if args.use_prompt_extend:
-        logging.info("Extending prompt ...")
+        logging.info("Extending prompt...")
         if rank == 0:
             input_prompt = args.prompt
             input_prompt = [input_prompt]
@@ -373,7 +308,7 @@ def generate(args):
         args.prompt = input_prompt[0]
         logging.info(f"Extended prompt: {args.prompt}")
     
-    logging.info("Creating WanI2V pipeline.")
+    logging.info("Creating WanI2V pipeline...")
     wan_i2v = wan.WanI2V(
         config=cfg,
         checkpoint_dir=args.ckpt_dir,
@@ -385,13 +320,13 @@ def generate(args):
         t5_cpu=args.t5_cpu,
         convert_model_dtype=args.convert_model_dtype,
     )
-    logging.info("Generating video ...")
+    logging.info("WanI2V pipeline created.")
+
+    logging.info("Generating video...")
     video = wan_i2v.generate(
         args.prompt,
         img,
         action_path=args.action_path,
-        allow_act2cam=args.allow_act2cam,
-        action_string=args.action_string,
         max_area=MAX_AREA_CONFIGS[args.size],
         frame_num=args.frame_num,
         shift=args.sample_shift,
@@ -400,13 +335,9 @@ def generate(args):
         guide_scale=args.sample_guide_scale,
         seed=args.base_seed,
         offload_model=args.offload_model)
+    logging.info("Video generation completed.")
 
     if rank == 0:
-        if args.overlay_actions and args.action_path is not None:
-            import numpy as np
-            action_data = np.load(os.path.join(args.action_path, "action.npy"))
-            video = _apply_action_overlay(video, action_data)
-
         if args.save_file is None:
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             formatted_prompt = args.prompt.replace(" ", "_").replace("/",
@@ -414,7 +345,7 @@ def generate(args):
             suffix = '.mp4'
             args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}" + suffix
 
-        logging.info(f"Saving generated video to {args.save_file}")
+        logging.info(f"Saving generated video to {args.save_file}...")
         save_video(
             tensor=video[None],
             save_file=args.save_file,
@@ -427,6 +358,7 @@ def generate(args):
                 merge_video_audio(video_path=args.save_file, audio_path=args.audio)
             else:
                 merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
+        logging.info("Video saved successfully.")
     del video
 
     torch.cuda.synchronize()
@@ -434,9 +366,126 @@ def generate(args):
         dist.barrier()
         dist.destroy_process_group()
 
-    logging.info("Finished.")
+    logging.info("Generation process finished.")
+
+
+def vbench_batch(args):
+    info_json = os.path.abspath(args.vbench_info_json or _DEFAULT_INFO_JSON)
+    crop_base = os.path.abspath(args.crop_dir or _DEFAULT_CROP_DIR)
+    image_dir = os.path.join(crop_base, args.resolution)
+    out_dir   = os.path.abspath(args.vbench_output_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    stats_path = os.path.join(os.path.dirname(out_dir), 'vbench_stats.csv')
+    stats_f    = open(stats_path, 'w', newline='', encoding='utf-8')
+    stats_w    = csv.writer(stats_f)
+    stats_w.writerow(['task_idx', 'prompt', 'sample_idx', 'duration_s', 'gen_fps', 'out_path', 'status'])
+
+    if not os.path.isfile(info_json):
+        print(f'[vbench] ERROR: info JSON not found: {info_json}'); return
+    if not os.path.isdir(image_dir):
+        print(f'[vbench] ERROR: crop dir not found: {image_dir}'); return
+
+    with open(info_json, encoding='utf-8') as f:
+        entries = json.load(f)
+
+    allowed  = {t.strip() for t in args.image_types.split(',') if t.strip()} if args.image_types else None
+    populate = None
+
+    seen, prompts = set(), []
+    for e in entries:
+        name = e['image_name']
+        if name in seen: continue
+        if allowed and e.get('image_type') not in allowed: continue
+        if populate is not None and (e.get('image_type') in _POPULATED_TYPES) != populate: continue
+        seen.add(name)
+        prompts.append((name, e['prompt_en']))
+
+    print(f'[vbench] {len(prompts)} prompts × {args.num_samples} samples = {len(prompts) * args.num_samples} total')
+
+    cfg = WAN_CONFIGS[args.task]
+    wan_i2v = wan.WanI2V(
+        config=cfg,
+        checkpoint_dir=args.ckpt_dir,
+        device_id=0,
+        rank=0,
+        t5_fsdp=False,
+        dit_fsdp=False,
+        use_sp=False,
+        t5_cpu=args.t5_cpu,
+        convert_model_dtype=args.convert_model_dtype,
+    )
+
+    skipped = generated = errors = 0
+    total   = len(prompts) * args.num_samples
+    done    = 0
+    t_start = time.time()
+    print(f'[vbench] {len(prompts)} prompts × {args.num_samples} samples = {total} total')
+
+    for task_idx, (image_name, prompt) in enumerate(prompts):
+        image_path = os.path.join(image_dir, image_name)
+        if not os.path.isfile(image_path):
+            print(f'[vbench] skip {task_idx}: image not found — {image_path}')
+            continue
+
+        img = Image.open(image_path).convert("RGB")
+
+        for sample_idx in range(args.num_samples):
+            out_path = os.path.join(out_dir, f'{_safe(prompt)}-{sample_idx}.mp4')
+            if os.path.exists(out_path):
+                skipped += 1
+                done += 1
+                stats_w.writerow([task_idx, prompt, sample_idx, '', '', out_path, 'skipped'])
+                stats_f.flush()
+                continue
+
+            pct = 100 * done / total if total else 0
+            eta = ''
+            if done > 0:
+                secs_left = (time.time() - t_start) / done * (total - done)
+                eta = f'  ETA {int(secs_left//3600):02d}h{int(secs_left%3600//60):02d}m{int(secs_left%60):02d}s'
+            print(f'[vbench] [{done+1}/{total}  {pct:.0f}%{eta}]  prompt {task_idx+1}/{len(prompts)}  sample {sample_idx+1}/{args.num_samples}: {prompt[:50]}')
+            seed = args.base_seed + sample_idx
+            try:
+                with torch.inference_mode():
+                    t0 = time.time()
+                    video = wan_i2v.generate(
+                        prompt, img,
+                        max_area=MAX_AREA_CONFIGS[args.size],
+                        frame_num=args.frame_num,
+                        shift=args.sample_shift or cfg.sample_shift,
+                        sample_solver=args.sample_solver,
+                        sampling_steps=args.sample_steps or cfg.sample_steps,
+                        guide_scale=args.sample_guide_scale or cfg.sample_guide_scale,
+                        seed=seed,
+                        offload_model=True,
+                    )
+                    elapsed = time.time() - t0
+                frame_num = args.frame_num
+                gen_fps = frame_num / elapsed if elapsed > 0 else 0.0
+                from wan.utils.utils import save_video as _save_video
+                _save_video(tensor=video[None], save_file=out_path, fps=cfg.sample_fps,
+                            nrow=1, normalize=True, value_range=(-1, 1))
+                print(f'[vbench] saved {out_path}  ({gen_fps:.1f} gen-fps)')
+                stats_w.writerow([task_idx, prompt, sample_idx, f'{elapsed:.2f}', f'{gen_fps:.2f}', out_path, 'ok'])
+                stats_f.flush()
+                generated += 1
+            except Exception as exc:
+                print(f'[vbench] ERROR task {task_idx} sample {sample_idx}: {exc}')
+                stats_w.writerow([task_idx, prompt, sample_idx, '', '', out_path, 'error'])
+                stats_f.flush()
+                errors += 1
+            done += 1
+
+    elapsed_total = time.time() - t_start
+    stats_f.close()
+    print(f'\n[vbench] done — generated={generated}  skipped={skipped}  errors={errors}  elapsed={elapsed_total/60:.1f}m')
+    print(f'[vbench] stats → {stats_path}')
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    generate(args)
+    if args.vbench:
+        vbench_batch(args)
+    else:
+        generate(args)

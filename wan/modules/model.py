@@ -321,6 +321,7 @@ class WanModel(ModelMixin, ConfigMixin):
     def __init__(self,
                  model_type='t2v',
                  control_type='cam',
+                 cam_channels: int = None,
                  patch_size=(1, 2, 2),
                  text_len=512,
                  in_dim=16,
@@ -391,7 +392,9 @@ class WanModel(ModelMixin, ConfigMixin):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
 
-        if control_type == 'cam':
+        if cam_channels is not None:
+            control_dim = cam_channels
+        elif control_type == 'cam':
             control_dim = 6
         elif control_type == 'act':
             control_dim = 7
