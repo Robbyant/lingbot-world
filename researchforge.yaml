@@ -52,7 +52,9 @@ execution:
   mode: venv
   trusted_repository: true
   setup_command: "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -c \"import torch, numpy, psutil, yaml; print('deps ok')\""
-  screening_command: "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -m lite.train --screening --ckpt lite/_ckpt/model.pt && /Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -m lite.evaluate --screening --ckpt lite/_ckpt/model.pt --out artifacts/results.json"
+# screening_command removed: the reduced-budget screening stage under-trained
+# smaller models and false-rejected near-winners on the hard-constraint check.
+# Every experiment now runs the full benchmark and is judged on full metrics.
   full_command: "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -m lite.train --ckpt lite/_ckpt/model.pt && /Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -m lite.evaluate --ckpt lite/_ckpt/model.pt --out artifacts/results.json"
   result_file: "artifacts/results.json"
   timeout_minutes: 25
