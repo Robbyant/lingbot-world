@@ -45,11 +45,15 @@ execution:
   # Native venv mode is REQUIRED: the benchmark uses Apple MPS, which a Linux
   # Docker container cannot access. This runs the user's own code on their own
   # machine, hence trusted_repository: true.
+  # venv mode builds a fresh empty virtualenv; with network:none it cannot
+  # install torch. We deliberately invoke the system framework Python (which
+  # has torch + MPS) by absolute path, bypassing that empty venv. This is the
+  # user's own interpreter on their own trusted machine.
   mode: venv
   trusted_repository: true
-  setup_command: "python3 -c \"import torch, numpy, psutil, yaml; print('deps ok')\""
-  screening_command: "python3 -m lite.train --screening --ckpt lite/_ckpt/model.pt && python3 -m lite.evaluate --screening --ckpt lite/_ckpt/model.pt --out artifacts/results.json"
-  full_command: "python3 -m lite.train --ckpt lite/_ckpt/model.pt && python3 -m lite.evaluate --ckpt lite/_ckpt/model.pt --out artifacts/results.json"
+  setup_command: "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -c \"import torch, numpy, psutil, yaml; print('deps ok')\""
+  screening_command: "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -m lite.train --screening --ckpt lite/_ckpt/model.pt && /Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -m lite.evaluate --screening --ckpt lite/_ckpt/model.pt --out artifacts/results.json"
+  full_command: "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -m lite.train --ckpt lite/_ckpt/model.pt && /Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -m lite.evaluate --ckpt lite/_ckpt/model.pt --out artifacts/results.json"
   result_file: "artifacts/results.json"
   timeout_minutes: 25
   cpu_limit: 4
