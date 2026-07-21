@@ -96,4 +96,4 @@ validation:
 
 shipping:
   allow_branch_creation: true
-  allow_draft_pr: false
+  allow_draft_pr: true
