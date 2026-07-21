@@ -46,7 +46,10 @@ def main():
     dtype = torch_dtype(cfg.dtype)
 
     seeds = TRAIN_SEEDS[:40] if args.screening else TRAIN_SEEDS
-    steps = min(cfg.train_steps, 250) if args.screening else cfg.train_steps
+    # Screening must train long enough for SMALLER models to converge, or the
+    # hard-constraint check false-rejects them (they need more steps than the
+    # baseline to reach the same action-following). 600 is a fair filter budget.
+    steps = min(cfg.train_steps, 600) if args.screening else cfg.train_steps
 
     f0, a, f1 = get_dataset(seeds, cfg.ep_len, args.data_dir)
     f0 = torch.from_numpy(f0).permute(0, 3, 1, 2).contiguous()
