@@ -105,18 +105,20 @@ def evaluate(ckpt_path, device_str="auto", screening=False):
     # ResearchForge result schema v1: primary_metric + secondary_metrics dict.
     result = {
         "schema_version": 1,
+        # primary = params (minimize): the "lightweight" objective. Latency is
+        # overhead-bound at this scale, so it is a secondary/constraint metric.
         "primary_metric": {
-            "name": "latency_ms_per_frame",
-            "value": round(latency_ms, 4),
+            "name": "params",
+            "value": float(params),
         },
         "secondary_metrics": {
+            "latency_ms_per_frame": round(latency_ms, 4),
             "ssim": round(ssim_fn(preds, gts), 5),
             "action_following": round(af_correct / max(1, af_total), 5),
             "peak_ram_mb": round(peak, 2),
             "psnr": round(psnr_fn(preds, gts), 4),
             "mse": round(mse_fn(preds, gts), 6),
             "model_mb": round(params * (2 if cast else 4) / 1e6, 3),
-            "params": float(params),
         },
         "sample_count": int(n_frames),
         "seed": int(cfg.seed),
