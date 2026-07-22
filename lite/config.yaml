@@ -1,0 +1,18 @@
+# Baseline world-model configuration (EDITABLE by experiments).
+# Each knob maps to a hypothesis; the baseline is deliberately the "heavy"
+# reference: full context branch, more refine steps, wider backbone.
+
+base_ch: 24            # backbone width               (hyp-003)
+depth: 2               # down/up stages               (hyp-003)
+refine_steps: 3        # bottleneck refine iterations  (hyp-001)
+action_emb: 32
+cond_mode: action              # compact action-only conditioning (hyp-002)
+context_dim: 256
+dtype: float32         # compute/param precision      (hyp-004)
+
+# training
+train_steps: 1800
+batch_size: 64
+lr: 0.0006
+ep_len: 12
+seed: 0

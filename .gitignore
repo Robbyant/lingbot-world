@@ -15,3 +15,6 @@ lingbot-world-fast/
 output/
 *.mp4
 !assets/*.mp4
+lite/_data/
+lite/_ckpt/
+lite/_out/

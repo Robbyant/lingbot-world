@@ -1,0 +1,99 @@
+# ResearchForge experiment contract  --  lingbot-lite proxy world model
+# Frozen evaluation for the "runnable lightweight world model" project.
+#   researchforge contract validate
+#   researchforge contract approve
+
+version: 1
+
+project:
+  name: "lingbot"
+  mode: improve_repository
+
+objective:
+  description: >-
+    Reduce inference latency of a runnable action-conditioned world model on a
+    MacBook (MPS) WITHOUT compromising world-generation quality or movement
+    (action-following) fidelity. All numbers are proxy-model measurements on a
+    deterministic raycaster world, never the real lingbot-world A14B model.
+  # "Lightweight" = fewer parameters. Latency proved overhead-bound at this
+  # model scale (halving params does not change wall-clock on MPS at 64x64),
+  # so params is the metric that actually reflects the objective. Latency is
+  # kept as a no-regression constraint so "without compromising latency" holds.
+  primary_metric:
+    name: "params"
+    direction: minimize
+  # Quality/movement must not be compromised (floors from baseline ssim 0.751,
+  # action_following 0.938); latency must not regress; peak RAM guarded.
+  hard_constraints:
+    - name: ssim
+      operator: ">="
+      value: 0.70
+    - name: action_following
+      operator: ">="
+      value: 0.85
+    - name: latency_ms_per_frame
+      operator: "<="
+      value: 9.0
+    - name: peak_ram_mb
+      operator: "<="
+      value: 1500
+  secondary_metrics:
+    - latency_ms_per_frame
+    - ssim
+    - action_following
+    - peak_ram_mb
+    - psnr
+    - model_mb
+
+repository:
+  baseline_ref: "main"
+
+execution:
+  # Native venv mode is REQUIRED: the benchmark uses Apple MPS, which a Linux
+  # Docker container cannot access. This runs the user's own code on their own
+  # machine, hence trusted_repository: true.
+  # venv mode builds a fresh empty virtualenv; with network:none it cannot
+  # install torch. We deliberately invoke the system framework Python (which
+  # has torch + MPS) by absolute path, bypassing that empty venv. This is the
+  # user's own interpreter on their own trusted machine.
+  mode: venv
+  trusted_repository: true
+  setup_command: "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -c \"import torch, numpy, psutil, yaml; print('deps ok')\""
+# screening_command removed: the reduced-budget screening stage under-trained
+# smaller models and false-rejected near-winners on the hard-constraint check.
+# Every experiment now runs the full benchmark and is judged on full metrics.
+  full_command: "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -m lite.train --ckpt lite/_ckpt/model.pt && /Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -m lite.evaluate --ckpt lite/_ckpt/model.pt --out artifacts/results.json"
+  result_file: "artifacts/results.json"
+  timeout_minutes: 25
+  cpu_limit: 4
+  memory_mb: 12000
+  max_experiments: 8
+
+permissions:
+  # Experiments may only change the model architecture, its training recipe,
+  # and its config. The world (ground truth), the metrics, and the evaluator
+  # are protected so results cannot be gamed.
+  editable_paths:
+    - "lite/model.py"
+    - "lite/train.py"
+    - "lite/config.yaml"
+  protected_paths:
+    - ".researchforge/"
+    - "researchforge.yaml"
+    - "lite/common.py"
+    - "lite/worldgen.py"
+    - "lite/evaluate.py"
+
+network:
+  mode: none
+
+secrets:
+  forward_environment_variables: []
+
+validation:
+  repeat_finalists: 3
+  require_existing_tests: false
+
+shipping:
+  allow_branch_creation: true
+  allow_draft_pr: true
