@@ -599,17 +599,22 @@ class WanI2VFast:
             latent = noise
             latents_chunk = latent.split(chunk_size, dim=1) # [c, f, h, w]
             condition_chunk = y.split(chunk_size, dim=1)
-            c2ws_plucker_emb_chunk = c2ws_plucker_emb.split(chunk_size, dim=2)
+            if action_path is not None:
+                c2ws_plucker_emb_chunks = c2ws_plucker_emb.split(chunk_size, dim=2)
+            else:
+                c2ws_plucker_emb_chunks = None
             num_inference_chunk = len(latents_chunk)
             pred_latent_chunks = []
             for chunk_id in tqdm(range(num_inference_chunk)):
                 current_latent = latents_chunk[chunk_id]
                 current_condition = condition_chunk[chunk_id]
-                current_c2ws_plucker_emb = c2ws_plucker_emb_chunk[chunk_id]
-
-                dit_cond_dict = {
-                    "c2ws_plucker_emb": current_c2ws_plucker_emb.chunk(1, dim=0),
-                }
+                if c2ws_plucker_emb_chunks is not None:
+                    current_control = c2ws_plucker_emb_chunks[chunk_id]
+                    dit_cond_dict = {
+                        "c2ws_plucker_emb": current_control.chunk(1, dim=0),
+                    }
+                else:
+                    dit_cond_dict = None
 
                 kwargs = {
                     'context': [context[0]],
