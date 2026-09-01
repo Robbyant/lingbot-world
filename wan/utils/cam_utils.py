@@ -40,6 +40,72 @@ def interpolate_camera_poses(
     return torch.from_numpy(poses).float()
 
 
+def interpolate_camera_intrinsics(
+    src_indices: np.ndarray,
+    src_intrinsics: torch.Tensor,
+    tgt_indices: np.ndarray,
+) -> torch.Tensor:
+    """Interpolate per-frame pinhole intrinsics onto a target frame grid."""
+    if src_intrinsics.ndim != 2 or src_intrinsics.shape[1] != 4:
+        raise ValueError(
+            "src_intrinsics must have shape [num_frames, 4] for "
+            "[fx, fy, cx, cy]"
+        )
+    if len(src_indices) != len(src_intrinsics):
+        raise ValueError(
+            "src_indices and src_intrinsics must contain the same number of frames"
+        )
+
+    numpy_intrinsics = src_intrinsics.detach().cpu()
+    if numpy_intrinsics.dtype == torch.bfloat16:
+        numpy_intrinsics = numpy_intrinsics.float()
+
+    interp_func = interp1d(
+        src_indices,
+        numpy_intrinsics.numpy(),
+        axis=0,
+        kind="linear",
+        bounds_error=False,
+        fill_value="extrapolate",
+    )
+    interpolated = interp_func(tgt_indices)
+    return torch.as_tensor(
+        interpolated, dtype=src_intrinsics.dtype, device=src_intrinsics.device
+    )
+
+
+def resample_camera_intrinsics(
+    src_indices: np.ndarray,
+    src_intrinsics: torch.Tensor,
+    tgt_indices: np.ndarray,
+    force_static: bool = False,
+) -> torch.Tensor:
+    """Select and resample calibration for a camera trajectory."""
+    if src_intrinsics.ndim != 2 or src_intrinsics.shape[1] != 4:
+        raise ValueError(
+            "src_intrinsics must have shape [num_frames, 4] for "
+            "[fx, fy, cx, cy]"
+        )
+    if len(src_intrinsics) == 0:
+        raise ValueError("src_intrinsics must contain at least one frame")
+
+    target_frames = len(tgt_indices)
+    if force_static or len(src_intrinsics) == 1:
+        return src_intrinsics[0:1].repeat(target_frames, 1)
+
+    source_frames = len(src_indices)
+    if len(src_intrinsics) < source_frames:
+        raise ValueError(
+            "intrinsics.npy must contain at least as many frames as poses.npy"
+        )
+
+    return interpolate_camera_intrinsics(
+        src_indices,
+        src_intrinsics[:source_frames],
+        tgt_indices,
+    )
+
+
 def SE3_inverse(T: torch.Tensor) -> torch.Tensor:
     Rot = T[:, :3, :3] # [B,3,3]
     trans = T[:, :3, 3:] # [B,3,1]

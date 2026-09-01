@@ -32,6 +32,7 @@ from .utils.cam_utils import (
     interpolate_camera_poses,
     get_plucker_embeddings,
     get_Ks_transformed,
+    resample_camera_intrinsics,
 )
 from einops import rearrange
 
@@ -392,17 +393,27 @@ class WanI2V:
                                     width_resize=w,
                                     height_final=h,
                                     width_final=w)
-            Ks = Ks[0]
-            
+
             len_c2ws = len(c2ws)
+            src_indices = np.linspace(0, len_c2ws - 1, len_c2ws)
+            tgt_indices = np.linspace(
+                0, len_c2ws - 1, int((len_c2ws - 1) // 4) + 1
+            )
             c2ws_infer = interpolate_camera_poses(
-                src_indices=np.linspace(0, len_c2ws - 1, len_c2ws),
+                src_indices=src_indices,
                 src_rot_mat=c2ws[:, :3, :3],
                 src_trans_vec=c2ws[:, :3, 3],
-                tgt_indices=np.linspace(0, len_c2ws - 1, int((len_c2ws - 1) // 4) + 1),
+                tgt_indices=tgt_indices,
             )
             c2ws_infer = compute_relative_poses(c2ws_infer, framewise=True)
-            Ks = Ks.repeat(len(c2ws_infer), 1)
+            # Action-to-camera trajectories do not share a timeline with the
+            # calibration file, so they retain the original static-K behavior.
+            Ks = resample_camera_intrinsics(
+                src_indices,
+                Ks,
+                tgt_indices,
+                force_static=allow_act2cam,
+            )
 
             c2ws_infer = c2ws_infer.to(self.device)
             Ks = Ks.to(self.device)
