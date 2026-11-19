@@ -4,8 +4,8 @@ import binascii
 import logging
 import os
 import os.path as osp
-import shutil
 import subprocess
+import tempfile
 
 import imageio
 import torch
@@ -41,10 +41,10 @@ def merge_video_audio(video_path: str, audio_path: str):
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"audio file {audio_path} does not exist")
 
-    base, ext = os.path.splitext(video_path)
-    temp_output = f"{base}_temp{ext}"
-
-    try:
+    video_dir = os.path.dirname(os.path.abspath(video_path))
+    filename = os.path.basename(video_path)
+    with tempfile.TemporaryDirectory(prefix=".mux-", dir=video_dir) as temp_dir:
+        temp_output = os.path.join(temp_dir, filename)
         # create ffmpeg command
         command = [
             'ffmpeg',
@@ -78,13 +78,8 @@ def merge_video_audio(video_path: str, audio_path: str):
             logging.error(error_msg)
             raise RuntimeError(error_msg)
 
-        shutil.move(temp_output, video_path)
+        os.replace(temp_output, video_path)
         logging.info(f"Merge completed, saved to {video_path}")
-
-    except Exception as e:
-        if os.path.exists(temp_output):
-            os.remove(temp_output)
-        logging.error(f"merge_video_audio failed with error: {e}")
 
 
 def save_video(tensor,
